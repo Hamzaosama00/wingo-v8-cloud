@@ -999,6 +999,139 @@ class PredictorEngine:
         }
 
     # ---------------------------------------------------------
+    # V8.3 Flash selective-prediction helpers
+    # ---------------------------------------------------------
+
+    def entropy_trend(self, sequence: Sequence[int], window: int = 30) -> float:
+        """Positive = entropy is rising (recent sequence is becoming less structured)."""
+        seq = list(sequence)
+        if len(seq) < 20:
+            return 0.0
+
+        def window_entropy(values: Sequence[int]) -> float:
+            counts = {n: 1e-9 for n in NUMBER_STATES}
+            for value in values:
+                counts[int(value)] += 1.0
+            return self.normalized_entropy(self.normalize(counts, NUMBER_STATES))
+
+        w = min(window, len(seq) // 2)
+        if w < 10:
+            return 0.0
+        previous = window_entropy(seq[-2*w:-w])
+        recent = window_entropy(seq[-w:])
+        return recent - previous
+
+    def regime_priors(self, regime: str) -> Dict[str, float]:
+        """Explicit model families per regime; normalized before use."""
+        if regime == "stable":
+            raw = {
+                "ema": 0.08, "markov": 0.34, "pattern": 0.34,
+                "frequency": 0.08, "lag": 0.08, "zscore": 0.03, "momentum": 0.05,
+            }
+        elif regime == "choppy":
+            raw = {
+                "ema": 0.30, "markov": 0.06, "pattern": 0.06,
+                "frequency": 0.12, "lag": 0.08, "zscore": 0.32, "momentum": 0.06,
+            }
+        else:
+            raw = {
+                "ema": 0.12, "markov": 0.12, "pattern": 0.10,
+                "frequency": 0.28, "lag": 0.08, "zscore": 0.08, "momentum": 0.22,
+            }
+        total = sum(raw.values()) or 1.0
+        return {k: v / total for k, v in raw.items()}
+
+    def flash_number_weights(self, sequence: Sequence[int]) -> Tuple[Dict[str, float], Dict[str, Dict[str, float]], str]:
+        """Blend walk-forward quality with regime-specific priors."""
+        adaptive, stats = self.adaptive_number_weights(sequence)
+        _, _, regime = self.dynamic_window_for_sequence(sequence)
+        priors = self.regime_priors(regime)
+        raw = {}
+        for name in adaptive:
+            # Keep performance evidence, but force a meaningful regime specialization.
+            raw[name] = max(1e-9, adaptive[name]) * (0.35 + 0.65 * priors.get(name, 0.0) * 7.0)
+        total = sum(raw.values()) or 1.0
+        return {k: v / total for k, v in raw.items()}, stats, regime
+
+    def triadic_cooccurrence(self, games: List[Dict[str, Any]], window: int = 120) -> Dict[str, Any]:
+        """
+        Tracks observed Color|Size|Parity joint states.
+        These features are derived from the same number, so this is a joint-state
+        context model, not independent causal correlation.
+        """
+        recent = games[-window:]
+        counts: Dict[str, float] = {}
+        for game in recent:
+            key = self.joint_key(self.joint_state(game))
+            counts[key] = counts.get(key, 0.0) + 1.0
+
+        total = sum(counts.values()) or 1.0
+        distribution = {k: v / total for k, v in counts.items()}
+        strongest = max(distribution.items(), key=lambda kv: kv[1]) if distribution else ("", 0.0)
+        return {
+            "distribution": distribution,
+            "strongest_state": strongest[0],
+            "strength": float(strongest[1]),
+            "support": len(recent),
+        }
+
+    def flash_predict_number(self, games: List[Dict[str, Any]]) -> Dict[str, Any]:
+        full = [int(game["number"]) for game in games]
+        window, adaptive_volatility, regime = self.dynamic_window_for_sequence(full)
+        sequence = full[-window:] if window else full
+        candidates = self.candidate_number_distributions(sequence)
+        weights, backtest, regime = self.flash_number_weights(sequence)
+
+        distribution = {
+            n: sum(weights[name] * candidates[name][n] for name in candidates)
+            for n in NUMBER_STATES
+        }
+        distribution = self.normalize(distribution, NUMBER_STATES)
+        ordered = sorted(distribution.items(), key=lambda item: item[1], reverse=True)
+        prediction = int(ordered[0][0])
+        score = float(ordered[0][1])
+        margin = score - float(ordered[1][1])
+        entropy = self.normalized_entropy(distribution)
+        trend = self.entropy_trend(sequence)
+
+        # Model agreement: count candidate models whose top digit maps to the
+        # same Big/Small class as the ensemble prediction.
+        predicted_size = self.features_from_number(prediction)[1]
+        size_votes = 0
+        for dist in candidates.values():
+            top = int(max(dist, key=dist.get))
+            if self.features_from_number(top)[1] == predicted_size:
+                size_votes += 1
+        model_agreement = size_votes / max(len(candidates), 1)
+
+        # Evidence score is deliberately conservative. It is NOT a win probability.
+        regime_stability = 1.0 if regime == "stable" else (0.60 if regime == "normal" else 0.25)
+        pattern_strength = min(1.0, max(0.0, margin / 0.10))
+        entropy_health = min(1.0, max(0.0, 1.0 - entropy))
+        confidence = max(0.0, min(1.0,
+            0.30 * model_agreement +
+            0.25 * regime_stability +
+            0.25 * pattern_strength +
+            0.20 * entropy_health
+        ))
+
+        return {
+            "prediction": prediction,
+            "score": score,
+            "margin": margin,
+            "entropy": entropy,
+            "entropy_trend": trend,
+            "distribution": distribution,
+            "weights": weights,
+            "backtest": backtest,
+            "adaptive_window": window,
+            "adaptive_volatility": adaptive_volatility,
+            "adaptive_regime": regime,
+            "confidence": confidence,
+            "model_agreement": model_agreement,
+        }
+
+    # ---------------------------------------------------------
     # Prediction decision
     # ---------------------------------------------------------
 
@@ -1051,37 +1184,74 @@ class PredictorEngine:
         return "MEDIUM"
 
     def build_prediction(self, games: List[Dict[str, Any]]) -> Dict[str, Any]:
-        number=self.predict_number(games)
-        color_value,size_value,parity_value=self.features_from_number(number["prediction"])
-        color=self.predict_feature(games,"color",COLOR_STATES)
-        size=self.predict_feature(games,"size",SIZE_STATES)
-        parity=self.predict_feature(games,"parity",PARITY_STATES)
-        joint_state=(color_value,size_value,parity_value)
-        agreement=self.agreement_count(joint_state,color["prediction"],size["prediction"],parity["prediction"])
+        number = self.flash_predict_number(games)
+        color_value, size_value, parity_value = self.features_from_number(number["prediction"])
 
-        # V8.3: strict signal/noise gate. "confidence" is an evidence score,
-        # not a guaranteed probability of the next outcome.
-        confidence=float(number["confidence"])
-        entropy=float(number["entropy"])
-        margin=float(number["margin"])
-        signal="SKIP"
-        if confidence >= 0.70 and margin >= 0.035 and entropy <= 0.82 and agreement >= 2:
-            signal="MEDIUM"
-        if confidence >= 0.82 and margin >= 0.060 and entropy <= 0.72 and agreement == 3:
-            signal="HIGH"
+        color = self.predict_feature(games, "color", COLOR_STATES)
+        size = self.predict_feature(games, "size", SIZE_STATES)
+        parity = self.predict_feature(games, "parity", PARITY_STATES)
+        joint_state = (color_value, size_value, parity_value)
+        agreement = self.agreement_count(
+            joint_state, color["prediction"], size["prediction"], parity["prediction"]
+        )
 
-        volatility=self.combined_volatility(games)
-        joint={
-            "prediction":joint_state,"score":number["score"],"margin":margin,
-            "entropy":entropy,"distribution":{},"weights":number["weights"],
-            "total_support":len(games),"volatility":volatility,
-            "regime":number["adaptive_regime"],"number_prediction":number["prediction"],
-            "number_distribution":number["distribution"],"backtest":number["backtest"],
-            "confidence":confidence,"adaptive_window":number["adaptive_window"],
-            "z_scores":number["z_scores"],"lag_strength":number["lag_strength"],
-            "momentum":number["momentum"],
+        confidence = float(number["confidence"])
+        entropy = float(number["entropy"])
+        entropy_trend = float(number["entropy_trend"])
+        margin = float(number["margin"])
+        regime = str(number["adaptive_regime"])
+        model_agreement = float(number["model_agreement"])
+        triadic = self.triadic_cooccurrence(games)
+
+        signal = "SKIP"
+        reason = "confidence_below_0.85"
+
+        # Strict V8.3 Flash gate: abstention is the default.
+        if regime == "choppy":
+            reason = "choppy_regime"
+        elif entropy_trend > 0.015:
+            reason = "entropy_rising"
+        elif agreement < 3:
+            reason = "feature_disagreement"
+        elif model_agreement < 0.70:
+            reason = "model_disagreement"
+        elif entropy > 0.82:
+            reason = "high_entropy"
+        elif margin < 0.045:
+            reason = "weak_margin"
+        elif confidence < 0.85:
+            reason = "confidence_below_0.85"
+        else:
+            signal = "HIGH"
+            reason = "strict_gate_passed"
+
+        volatility = self.combined_volatility(games)
+        joint = {
+            "prediction": joint_state,
+            "score": number["score"],
+            "margin": margin,
+            "entropy": entropy,
+            "entropy_trend": entropy_trend,
+            "distribution": {},
+            "weights": number["weights"],
+            "total_support": len(games),
+            "volatility": volatility,
+            "regime": regime,
+            "number_prediction": number["prediction"],
+            "number_distribution": number["distribution"],
+            "backtest": number["backtest"],
+            "confidence": confidence,
+            "model_agreement": model_agreement,
+            "adaptive_window": number["adaptive_window"],
+            "triadic_cooccurrence": triadic,
+            "gate_reason": reason,
         }
-        return {"joint":joint,"number":number,"color":color,"size":size,"parity":parity,"agreement":agreement,"signal":signal}
+        return {
+            "joint": joint, "number": number, "color": color, "size": size,
+            "parity": parity, "agreement": agreement, "signal": signal,
+            "gate_reason": reason,
+        }
+
 
     # ---------------------------------------------------------
     # Save / verify predictions
@@ -1490,7 +1660,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="WinGo Statistical Predictor API",
-    version="8.3.1",
+    version="8.3-flash",
     lifespan=lifespan,
 )
 
@@ -1518,7 +1688,7 @@ app.add_middleware(
 def root():
     return {
         "name": "WinGo Statistical Predictor API",
-        "version": "8.3.1",
+        "version": "8.3-flash",
         "status": "online",
         "docs": "/docs",
     }
@@ -1599,7 +1769,7 @@ def compare_predictions(limit: int = 50):
         items.append(x)
 
     return {
-        "model_version": "8.3.1",
+        "model_version": "8.3-flash",
         "verified": verified,
         "joint_wins": wins,
         "joint_accuracy": round((wins / verified * 100), 2) if verified else None,
@@ -1685,5 +1855,5 @@ def ingest_round(round_data: RoundInput):
         "prediction": prediction,
         "firebase_error": firebase_error,
         "storage": "firestore-primary/sqlite-cache",
-        "model_version": "8.3.1",
+        "model_version": "8.3-flash",
     }

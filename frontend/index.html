@@ -231,7 +231,7 @@ tbody tr.new-row{animation:newRow 0.6s ease}
   <div class="topbar">
     <div class="topbar-left">
       <span class="dot idle" id="statusDot"></span>
-      <span id="statusText">IDLE</span>
+      <span id="statusText">STARTING</span>
       <span style="color:var(--muted-2)">·</span>
       <span id="modeLabel" style="color:var(--muted)">STANDBY</span>
     </div>
@@ -274,9 +274,9 @@ tbody tr.new-row{animation:newRow 0.6s ease}
       </div>
     </div>
     <div class="conn-row">
-      <input class="input" id="urlInput" placeholder="https://your-backend-url.com" spellcheck="false">
+      <input class="input" id="urlInput" placeholder="https://your-backend-url.com (Optional)" spellcheck="false">
       <button class="btn" id="connectBtn">Connect</button>
-      <button class="btn ghost" id="demoBtn">Demo Mode</button>
+      <button class="btn ghost" id="demoBtn">Demo Mode: ON</button>
     </div>
   </section>
 
@@ -349,7 +349,7 @@ tbody tr.new-row{animation:newRow 0.6s ease}
             <tr><th>Period</th><th>Num</th><th>Color</th><th>Size</th><th>Time</th></tr>
           </thead>
           <tbody id="historyBody">
-            <tr><td colspan="5" style="text-align:center;color:var(--muted-2);padding:30px">No data yet — connect a backend or enable Demo Mode</td></tr>
+            <tr><td colspan="5" style="text-align:center;color:var(--muted-2);padding:30px">Initializing live stream...</td></tr>
           </tbody>
         </table>
       </div>
@@ -374,7 +374,7 @@ tbody tr.new-row{animation:newRow 0.6s ease}
         <button class="btn-mini" id="expandJson">EXPAND</button>
       </div>
     </div>
-    <div class="json-output" id="jsonOutput">// Set backend URL or enable Demo Mode to inspect raw payload</div>
+    <div class="json-output" id="jsonOutput">// Waiting for stream...</div>
   </section>
 
   <footer class="foot">WINGO V8 CLOUD · <span>LIVE STREAMING ENGINE</span> · ALL TIMES LOCAL</footer>
@@ -390,10 +390,10 @@ tbody tr.new-row{animation:newRow 0.6s ease}
         <div class="setting-desc">Poll backend interval</div>
       </div>
       <select class="select" id="refreshRate">
+        <option value="1000">1s</option>
         <option value="2000">2s</option>
         <option value="5000" selected>5s</option>
         <option value="10000">10s</option>
-        <option value="30000">30s</option>
       </select>
     </div>
     <div class="setting-row">
@@ -427,24 +427,23 @@ tbody tr.new-row{animation:newRow 0.6s ease}
 
 <script>
 // ============================================================
-// WinGo V8 Cloud — Live Console
+// WinGo V8 Cloud — Live Console (Auto-Start Engine)
 // ============================================================
 const $ = id => document.getElementById(id);
 const state = {
   url: localStorage.getItem('wingo_url') || '',
   mode: 'idle',
-  refreshRate: 5000,
+  refreshRate: 1000, 
   sound: false,
   live: true,
   highlight: true,
   data: null,
   lastPeriod: null,
   history: [],
-  stats: { periods: 0, winRate: 50, pnl: 0, sessions: 0 },
-  prevStats: { periods: 0, winRate: 50, pnl: 0, sessions: 0 }
+  stats: { periods: 1284, winRate: 67.3, pnl: 1245.50, sessions: 142 },
+  prevStats: { periods: 1284, winRate: 67.3, pnl: 1245.50, sessions: 142 }
 };
 
-// ---------- Toast ----------
 function toast(msg, type = 'info', ttl = 2800) {
   const t = document.createElement('div');
   t.className = 'toast ' + type;
@@ -458,7 +457,6 @@ function toast(msg, type = 'info', ttl = 2800) {
   }, ttl);
 }
 
-// ---------- Log ----------
 function log(type, msg) {
   const box = $('logBox');
   const entry = document.createElement('div');
@@ -470,7 +468,6 @@ function log(type, msg) {
   while (box.children.length > 80) box.lastChild.remove();
 }
 
-// ---------- Helpers ----------
 function getColor(n) {
   if (n === 0) return 'violet';
   return [1,3,7,9].includes(n) ? 'red' : 'green';
@@ -479,7 +476,6 @@ function getSize(n) { return n >= 5 ? 'big' : 'small'; }
 function fmtNum(n) { return Math.round(n).toLocaleString('en-US'); }
 function fmtMoney(n) { return (n >= 0 ? '+' : '') + n.toFixed(2); }
 
-// ---------- Status ----------
 function setStatus(mode) {
   state.mode = mode;
   const dot = $('statusDot'), text = $('statusText'), ml = $('modeLabel');
@@ -490,14 +486,12 @@ function setStatus(mode) {
   else { dot.classList.add('idle'); text.textContent = 'IDLE'; ml.textContent = 'STANDBY'; ml.style.color = 'var(--muted)'; }
 }
 
-// ---------- Clock ----------
 function tickClock() {
   $('clock').textContent = new Date().toLocaleTimeString('en-US', { hour12: false });
 }
 setInterval(tickClock, 1000);
 tickClock();
 
-// ---------- Demo data ----------
 let demoPeriod = 20250101000 + Math.floor(Math.random() * 8000);
 function genDemoData() {
   const number = Math.floor(Math.random() * 10);
@@ -530,7 +524,6 @@ function genDemoData() {
   };
 }
 
-// ---------- Fetch ----------
 async function fetchLive() {
   if (!state.url) return null;
   const t0 = performance.now();
@@ -552,7 +545,6 @@ async function load() {
   let json;
   try {
     if (state.mode === 'demo') {
-      await new Promise(r => setTimeout(r, 80 + Math.random() * 150));
       json = genDemoData();
     } else if (state.url && state.mode !== 'error') {
       json = await fetchLive();
@@ -570,7 +562,6 @@ async function load() {
   }
 }
 
-// ---------- Render ----------
 function render(data) {
   renderJSON(data);
 
@@ -588,7 +579,6 @@ function render(data) {
     $('lastTags').innerHTML = `<span class="tag ${color}">${color.toUpperCase()}</span><span class="tag ${size}">${size.toUpperCase()}</span>`;
   }
 
-  // Stats
   const stats = data.stats || data.statistics || {};
   state.prevStats = { ...state.stats };
   state.stats = {
@@ -602,11 +592,9 @@ function render(data) {
   updateStat('statPnl', state.stats.pnl, state.prevStats.pnl, fmtMoney, fmtMoney);
   updateStat('statSessions', state.stats.sessions, state.prevStats.sessions, fmtNum);
 
-  // PnL color
   const pnlEl = $('statPnl');
   pnlEl.className = 'stat-value ' + (state.stats.pnl > 0 ? 'profit' : state.stats.pnl < 0 ? 'loss' : '');
 
-  // History
   if (state.live && period && period !== state.lastPeriod) {
     state.lastPeriod = period;
     const isNew = state.history.length > 0;
@@ -618,9 +606,8 @@ function render(data) {
     renderHistory(isNew);
     renderDistribution();
     if (state.sound) beep();
-    log('success', `Period ${period} → ${number} ${color.toUpperCase()} ${size.toUpperCase()}`);
+    log('success', `Period ${period} -> ${number} ${color.toUpperCase()} ${size.toUpperCase()}`);
   } else if (state.history.length === 0 && number !== undefined) {
-    // Seed initial row
     state.history.unshift({ period, number, color, size, time: new Date().toLocaleTimeString('en-US', { hour12: false }) });
     renderHistory(false);
     renderDistribution();
@@ -635,10 +622,10 @@ function updateStat(id, val, prev, fmt, fmtDelta) {
   const fmtD = fmtDelta || fmt;
   if (delta > 0.001) {
     deltaEl.className = 'stat-delta up';
-    deltaEl.textContent = '▲ +' + fmtD(delta).replace(/^+/,'').replace('+','');
+    deltaEl.textContent = '▲ +' + fmtD(Math.abs(delta));
   } else if (delta < -0.001) {
     deltaEl.className = 'stat-delta down';
-    deltaEl.textContent = '▼ ' + fmtD(delta).replace('+','');
+    deltaEl.textContent = '▼ ' + fmtD(Math.abs(delta));
   } else {
     deltaEl.className = 'stat-delta flat';
     deltaEl.textContent = '— 0';
@@ -677,7 +664,6 @@ function renderDistribution() {
   $('distMeta').textContent = `Last ${state.history.length} records`;
 }
 
-// ---------- JSON ----------
 let jsonExpanded = false;
 function renderJSON(data, filter = '') {
   const out = $('jsonOutput');
@@ -701,7 +687,6 @@ function renderJSON(data, filter = '') {
   }
 }
 
-// ---------- Countdown ----------
 let countdownSec = 60;
 setInterval(() => {
   if (state.mode === 'idle' || state.mode === 'error') return;
@@ -717,7 +702,6 @@ setInterval(() => {
   el.className = 'countdown' + (countdownSec <= 10 ? ' warn' : '');
 }, 1000);
 
-// ---------- Sound ----------
 let audioCtx;
 function beep() {
   try {
@@ -735,15 +719,19 @@ function beep() {
   } catch (e) {}
 }
 
-// ---------- Event handlers ----------
+// ---------- EVENT LISTENERS (Direct Binding) ----------
  $('connectBtn').addEventListener('click', () => {
   const v = $('urlInput').value.trim().replace(/\/$/, '');
-  if (!v) { toast('Enter a backend URL first', 'warn'); return; }
+  if (!v) { 
+    toast('No URL! Starting Demo Mode instead.', 'warn'); 
+    $('demoBtn').click(); 
+    return; 
+  }
   state.url = v;
   localStorage.setItem('wingo_url', v);
   setStatus('live');
   log('info', 'Connecting to ' + v);
-  toast('Connecting...', 'info', 1500);
+  toast('Connecting to backend...', 'info', 1500);
   load();
 });
 
@@ -752,11 +740,13 @@ function beep() {
     setStatus('idle');
     toast('Demo mode disabled', 'info');
     log('info', 'Demo mode disabled');
+    $('demoBtn').textContent = 'Demo Mode: OFF';
     return;
   }
   setStatus('demo');
-  log('info', 'Demo mode enabled — generating synthetic data');
-  toast('Demo mode active', 'success');
+  $('demoBtn').textContent = 'Demo Mode: ON';
+  log('info', 'Demo mode enabled - generating synthetic data');
+  toast('Demo mode active!', 'success');
   if (state.history.length === 0) {
     for (let i = 8; i >= 1; i--) {
       const n = Math.floor(Math.random() * 10);
@@ -766,10 +756,6 @@ function beep() {
         time: new Date(Date.now() - i * 60000).toLocaleTimeString('en-US', { hour12: false })
       });
     }
-    state.stats.periods = 1284;
-    state.stats.winRate = 67.3;
-    state.stats.pnl = 1245.50;
-    state.stats.sessions = 142;
     renderHistory(false);
     renderDistribution();
   }
@@ -778,7 +764,7 @@ function beep() {
 
  $('refreshBtn').addEventListener('click', () => {
   log('info', 'Manual refresh triggered');
-  if (state.mode === 'idle') { toast('Connect first or use Demo Mode', 'warn'); return; }
+  if (state.mode === 'idle') { toast('Starting Demo Mode...', 'info'); $('demoBtn').click(); return; }
   load();
 });
 
@@ -830,7 +816,6 @@ function beep() {
   if (state.data) renderJSON(state.data, e.target.value);
 });
 
-// ---------- Polling ----------
 let pollTimer;
 function restartPolling() {
   if (pollTimer) clearInterval(pollTimer);
@@ -840,11 +825,15 @@ function restartPolling() {
 }
 restartPolling();
 
-// ---------- Init ----------
- $('urlInput').value = state.url;
-setStatus('idle');
-log('info', 'System initialized — v8.0.1');
-log('info', 'Awaiting backend connection or Demo Mode');
+// ---------- AUTO-BOOT DEMO MODE ----------
+log('info', 'System initialized - v8.0.1');
+log('info', 'Auto-starting Demo Mode engine...');
+
+// Start Demo Mode Automatically after 800ms
+setTimeout(() => {
+  const demoBtn = $('demoBtn');
+  if (demoBtn) demoBtn.click();
+}, 800);
 
 // Keyboard shortcuts
 document.addEventListener('keydown', e => {

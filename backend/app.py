@@ -14,7 +14,7 @@ import numpy as np
 from sklearn.isotonic import IsotonicRegression
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -1320,281 +1320,405 @@ async def lifespan(app: FastAPI):
 
 
 # ============================================================
-# V9.2 PRO EXPERIMENTAL SIZE ENGINE
-# Walk-forward only; no future leakage; SKIP is first-class.
+# V9.3 FLASH SIZE ENGINE
+# Lightweight, strict-signal, walk-forward calibrated research model.
+# Firestore persistence remains handled by the backend below.
 # ============================================================
 
-V92_MIN_TRAIN = int(os.getenv("V92_MIN_TRAIN", "80"))
-V92_WINDOW = int(os.getenv("V92_WINDOW", "300"))
-V92_SIGNAL_THRESHOLD = float(os.getenv("V92_SIGNAL_THRESHOLD", "0.72"))
-V92_CHOPPY_THRESHOLD = float(os.getenv("V92_CHOPPY_THRESHOLD", "0.80"))
-V92_ENTROPY_STOP = float(os.getenv("V92_ENTROPY_STOP", "0.75"))
-V92_MIN_SUPPORT = int(os.getenv("V92_MIN_SUPPORT", "50"))
+V93_MIN_TRAIN = int(os.getenv("V93_MIN_TRAIN", "80"))
+V93_WINDOW = int(os.getenv("V93_WINDOW", "300"))
+V93_STABLE_THRESHOLD = float(os.getenv("V93_STABLE_THRESHOLD", "0.80"))
+V93_CHOPPY_THRESHOLD = float(os.getenv("V93_CHOPPY_THRESHOLD", "0.85"))
+V93_ENTROPY_STOP = float(os.getenv("V93_ENTROPY_STOP", "0.78"))
+V93_SWITCH_RATE_STOP = float(os.getenv("V93_SWITCH_RATE_STOP", "0.72"))
+V93_MIN_SUPPORT = int(os.getenv("V93_MIN_SUPPORT", "50"))
+V93_MIN_AGREEMENT = int(os.getenv("V93_MIN_AGREEMENT", "3"))
 
-def _b(x):
+def _v93_b(x):
     return 1 if str(x).lower() == "big" else 0
 
-def _binary_entropy(p):
+def _v93_clip(x, lo=0.02, hi=0.98):
+    return float(np.clip(float(x), lo, hi))
+
+def _v93_binary_entropy(p):
     p = min(max(float(p), 1e-9), 1 - 1e-9)
-    return -(p*math.log2(p) + (1-p)*math.log2(1-p))
+    return float(-(p*math.log2(p) + (1-p)*math.log2(1-p)))
 
-def _transition_stats(vals, lookback=30):
-    v = vals[-lookback:]
-    counts = [[1.0, 1.0], [1.0, 1.0]]  # Laplace smoothing
+def _v93_switch_rate(vals, n=20):
+    v = vals[-n:]
+    if len(v) < 2:
+        return 0.5
+    return float(sum(a != b for a, b in zip(v[:-1], v[1:])) / (len(v)-1))
+
+def _v93_transition_matrix(vals, n=40):
+    v = vals[-n:]
+    c = [[1.0, 1.0], [1.0, 1.0]]
     for a, b in zip(v[:-1], v[1:]):
-        counts[int(a)][int(b)] += 1.0
-    probs = []
-    for row in counts:
+        c[int(a)][int(b)] += 1.0
+    out = []
+    for row in c:
         s = sum(row)
-        probs.append([row[0]/s, row[1]/s])
-    return probs
+        out.append([row[0]/s, row[1]/s])
+    return out
 
-def _gap_since(vals, target):
-    gap = 0
+def _v93_transition_entropy(vals, n=30):
+    tm = _v93_transition_matrix(vals, n)
+    # Average conditional entropy H(next | current)
+    return float(sum(_v93_binary_entropy(row[1]) for row in tm) / 2.0)
+
+def _v93_gap_since(vals, target):
+    g = 0
     for x in reversed(vals):
         if x == target:
-            return gap
-        gap += 1
+            return g
+        g += 1
     return len(vals)
 
-def _sequence_stability(vals, n=12):
-    """Order-aware stability: low transition entropy + repeatable lag structure."""
+def _v93_ema(vals, span):
+    if not vals:
+        return 0.5
+    alpha = 2.0 / (span + 1.0)
+    e = float(vals[0])
+    for x in vals[1:]:
+        e = alpha*float(x) + (1-alpha)*e
+    return float(e)
+
+def _v93_sequence_stability(vals, n=16):
     v = vals[-n:]
     if len(v) < 5:
         return 0.5
-    tm = _transition_stats(v, len(v))
-    row_ent = []
-    for row in tm:
-        row_ent.append(_binary_entropy(row[1]))
-    transition_stability = 1.0 - sum(row_ent)/len(row_ent)
+    trans_entropy = _v93_transition_entropy(v, len(v))
     lag2 = np.mean([1.0 if v[i] == v[i-2] else 0.0 for i in range(2, len(v))])
-    return float(np.clip(0.65*transition_stability + 0.35*lag2, 0, 1))
+    return float(np.clip(0.7*(1.0-trans_entropy) + 0.3*lag2, 0, 1))
 
-def _regime(vals):
+def _v93_regime(vals):
     v = vals[-30:]
     if len(v) < 12:
         return "UNKNOWN", 1.0
-    p = sum(v)/len(v)
-    entropy = _binary_entropy(p)
-    stability = _sequence_stability(v)
-    # Binary std is a useful volatility proxy, but not a financial-market claim.
-    volatility = float(np.std(v))
-    choppy_score = float(np.clip(0.55*entropy + 0.30*(1-stability) + 0.15*(volatility/0.5), 0, 1))
+    r20 = sum(v[-20:])/min(20, len(v))
+    entropy = _v93_binary_entropy(r20)
+    t_entropy = _v93_transition_entropy(v)
+    switch_rate = _v93_switch_rate(v)
+    stability = _v93_sequence_stability(v)
+    choppy_score = float(np.clip(
+        0.30*entropy +
+        0.30*t_entropy +
+        0.25*switch_rate +
+        0.15*(1-stability),
+        0, 1
+    ))
     return ("CHOPPY" if choppy_score >= 0.68 else "STABLE"), choppy_score
 
-V92_FEATURE_NAMES = [
-    "big_ratio_5","big_ratio_10","big_ratio_20",
-    "lag1","lag2","lag3",
-    "p_big_after_current","gap_big","gap_small",
-    "run_length","sequence_stability","entropy20","volatility20",
-    "momentum_5_20",
-]
+def _v93_ngram_probability(vals, order=3):
+    """Pattern matcher: P(next=Big | recent context), Laplace smoothed."""
+    if len(vals) <= order:
+        return 0.5, 0
+    ctx = tuple(vals[-order:])
+    big = small = 1.0
+    support = 0
+    for i in range(order, len(vals)):
+        if tuple(vals[i-order:i]) == ctx:
+            support += 1
+            if vals[i] == 1:
+                big += 1
+            else:
+                small += 1
+    return float(big/(big+small)), support
 
-def _feature_row(vals):
-    def ratio(n):
-        z = vals[-n:]
-        return sum(z)/max(len(z),1)
-    tm = _transition_stats(vals, 30)
-    current = vals[-1] if vals else 0
-    run = 1
-    for x in reversed(vals[:-1]):
-        if x == current: run += 1
-        else: break
-    r5, r10, r20 = ratio(5), ratio(10), ratio(20)
-    return np.array([
-        r5, r10, r20,
-        vals[-1] if len(vals)>=1 else .5,
-        vals[-2] if len(vals)>=2 else .5,
-        vals[-3] if len(vals)>=3 else .5,
-        tm[int(current)][1],
-        min(_gap_since(vals,1),20)/20.0,
-        min(_gap_since(vals,0),20)/20.0,
-        min(run,10)/10.0,
-        _sequence_stability(vals),
-        _binary_entropy(r20),
-        float(np.std(vals[-20:] or [0])),
-        r5-r20,
-    ], dtype=float)
+def _v93_trend_model(vals):
+    """Trend follower: short/medium EMA + recent momentum."""
+    ema3 = _v93_ema(vals[-30:], 3)
+    ema8 = _v93_ema(vals[-50:], 8)
+    ema20 = _v93_ema(vals[-80:], 20)
+    momentum = (ema3 - ema20)
+    slope = (ema8 - ema20)
+    score = 0.5 + 0.75*momentum + 0.35*slope
+    return _v93_clip(score)
 
-def _make_supervised(vals, min_prefix=25):
-    X, y = [], []
-    for i in range(min_prefix, len(vals)):
-        X.append(_feature_row(vals[:i]))
-        y.append(vals[i])
-    return np.asarray(X), np.asarray(y, dtype=int)
-
-def _fit_logistic(train_vals, active_mask=None):
-    X, y = _make_supervised(train_vals)
-    if len(y) < V92_MIN_SUPPORT or len(set(y.tolist())) < 2:
-        return None
-    if active_mask is None:
-        active_mask = np.ones(X.shape[1], dtype=bool)
-    scaler = StandardScaler()
-    Xs = scaler.fit_transform(X[:, active_mask])
-    model = LogisticRegression(max_iter=500, C=0.7)
-    model.fit(Xs, y)
-    return scaler, model, active_mask
-
-def _ablation_mask(train_vals):
-    """Cheap walk-forward-inspired pruning on the training segment only.
-    Feature is kept unless removing it improves training-tail log loss materially.
-    This avoids using the future target being predicted.
+def _v93_reversion_model(vals):
+    """Reversionist: recent imbalance + gap pressure as a hypothesis feature.
+    It does not assume the process must revert; walk-forward calibration decides
+    whether this heuristic deserves confidence.
     """
-    X, y = _make_supervised(train_vals)
-    if len(y) < 100 or len(set(y.tolist())) < 2:
-        return np.ones(len(V92_FEATURE_NAMES), dtype=bool), {}
-    cut = max(60, int(len(y)*0.75))
-    Xtr, Xva, ytr, yva = X[:cut], X[cut:], y[:cut], y[cut:]
-    if len(set(ytr.tolist())) < 2 or len(yva) < 10:
-        return np.ones(len(V92_FEATURE_NAMES), dtype=bool), {}
-    def loss(mask):
-        sc = StandardScaler().fit(Xtr[:,mask])
-        m = LogisticRegression(max_iter=400, C=0.7).fit(sc.transform(Xtr[:,mask]), ytr)
-        p = np.clip(m.predict_proba(sc.transform(Xva[:,mask]))[:,1], 1e-6, 1-1e-6)
-        return float(-np.mean(yva*np.log(p)+(1-yva)*np.log(1-p)))
-    full = np.ones(X.shape[1], dtype=bool)
-    base_loss = loss(full)
-    report = {}
-    keep = full.copy()
-    for j, name in enumerate(V92_FEATURE_NAMES):
-        mask = full.copy(); mask[j] = False
-        try:
-            without = loss(mask)
-            importance = without - base_loss
-        except Exception:
-            importance = 0.0
-        report[name] = round(float(importance), 6)
-        # Only prune when removing the feature clearly helps validation loss.
-        if importance < -0.005:
-            keep[j] = False
-    if keep.sum() < 5:
-        keep[:] = True
-    return keep, report
+    if len(vals) < 20:
+        return 0.5
+    r10 = sum(vals[-10:]) / 10.0
+    r30 = sum(vals[-30:]) / min(30, len(vals))
+    gap_big = min(_v93_gap_since(vals, 1), 12) / 12.0
+    gap_small = min(_v93_gap_since(vals, 0), 12) / 12.0
+    gap_to_mean = 0.5 - r10
+    # Positive -> Big reversion hypothesis, negative -> Small.
+    score = 0.5 + 0.55*gap_to_mean + 0.18*(0.5-r30) + 0.12*(gap_big-gap_small)
+    return _v93_clip(score)
 
-def _markov_probability(vals):
-    tm = _transition_stats(vals, 40)
-    return float(tm[int(vals[-1])][1]) if vals else 0.5
+def _v93_pattern_model(vals):
+    """Pattern matcher: first-order Markov + 2/3-gram context."""
+    tm = _v93_transition_matrix(vals, 60)
+    markov = tm[int(vals[-1])][1] if vals else 0.5
+    p2, s2 = _v93_ngram_probability(vals, 2)
+    p3, s3 = _v93_ngram_probability(vals, 3)
+    # Context gets more weight only when repeated support exists.
+    w3 = min(s3/10.0, 1.0)
+    w2 = min(s2/15.0, 1.0)
+    denom = 1.0 + 0.8*w2 + 1.0*w3
+    p = (markov + 0.8*w2*p2 + 1.0*w3*p3) / denom
+    return _v93_clip(p), {"markov": markov, "ngram2_support": s2, "ngram3_support": s3}
 
-def _momentum_probability(vals):
-    if len(vals) < 20: return 0.5
-    r5 = sum(vals[-5:])/5
-    r20 = sum(vals[-20:])/20
-    return float(np.clip(0.5 + 0.8*(r5-r20), 0.05, 0.95))
+def _v93_raw_ensemble(vals):
+    trend = _v93_trend_model(vals)
+    revert = _v93_reversion_model(vals)
+    pattern, pmeta = _v93_pattern_model(vals)
+    regime, _ = _v93_regime(vals)
 
-def _raw_v92_probability(train_vals, active_mask=None):
-    fit = _fit_logistic(train_vals, active_mask)
-    p_lr = 0.5
-    if fit:
-        sc, model, mask = fit
-        p_lr = float(model.predict_proba(sc.transform(_feature_row(train_vals)[mask].reshape(1,-1)))[0,1])
-    p_mk = _markov_probability(train_vals)
-    p_mo = _momentum_probability(train_vals)
-    regime, _ = _regime(train_vals)
-    # Regime-specific ensemble. Weights are hypotheses, not claims of predictive edge.
+    # Diversified equal-weight base. In CHOPPY conditions, pattern matching gets
+    # a little more weight, but permission to predict is handled separately.
     if regime == "CHOPPY":
-        p = 0.25*p_lr + 0.50*p_mk + 0.25*p_mo
+        raw = 0.25*trend + 0.25*revert + 0.50*pattern
     else:
-        p = 0.50*p_lr + 0.20*p_mk + 0.30*p_mo
-    return float(np.clip(p, .02, .98)), (p_lr,p_mk,p_mo)
+        raw = (trend + revert + pattern) / 3.0
 
-def _walkforward_calibration(vals, active_mask):
+    votes = [
+        1 if trend >= 0.5 else 0,
+        1 if revert >= 0.5 else 0,
+        1 if pattern >= 0.5 else 0,
+    ]
+    return _v93_clip(raw), (trend, revert, pattern), votes, pmeta
+
+def _v93_walkforward(vals):
     raw, actual = [], []
-    start = max(V92_MIN_TRAIN, 40)
-    # Bound CPU/RAM on small cloud instances.
-    first = max(start, len(vals)-120)
+    first = max(V93_MIN_TRAIN, len(vals)-120)
     for i in range(first, len(vals)):
-        tr = vals[max(0,i-V92_WINDOW):i]
-        if len(tr) < start: continue
+        tr = vals[max(0, i-V93_WINDOW):i]
+        if len(tr) < V93_MIN_TRAIN:
+            continue
         try:
-            p, _ = _raw_v92_probability(tr, active_mask)
-            raw.append(p); actual.append(vals[i])
+            p, _, _, _ = _v93_raw_ensemble(tr)
+            raw.append(p)
+            actual.append(vals[i])
         except Exception:
             continue
-    if len(raw) < 30 or len(set(actual)) < 2:
-        return None, raw, actual
-    iso = IsotonicRegression(out_of_bounds="clip", y_min=0.02, y_max=0.98)
-    iso.fit(np.asarray(raw), np.asarray(actual))
+    iso = None
+    if len(raw) >= 30 and len(set(actual)) >= 2:
+        iso = IsotonicRegression(out_of_bounds="clip", y_min=0.02, y_max=0.98)
+        iso.fit(np.asarray(raw), np.asarray(actual))
     return iso, raw, actual
 
-def build_v92_pro(games):
-    games = list(reversed(games))  # engine history is newest-first
-    vals = [_b(g["size"]) for g in games if str(g.get("size","")).lower() in ("big","small")]
-    if len(vals) < V92_MIN_TRAIN:
-        return {"ready":False,"reason":f"need {V92_MIN_TRAIN} rounds","rounds":len(vals),"signal":"SKIP"}
+def build_v93_flash(games):
+    games = list(reversed(games))
+    vals = [_v93_b(g["size"]) for g in games if str(g.get("size","")).lower() in ("big","small")]
+    if len(vals) < V93_MIN_TRAIN:
+        return {
+            "ready": False,
+            "reason": f"need {V93_MIN_TRAIN} rounds",
+            "rounds": len(vals),
+            "signal": "SKIP",
+            "model": "V9.3 Flash"
+        }
 
-    vals = vals[-V92_WINDOW:]
-    mask, ablation = _ablation_mask(vals)
-    raw_p, components = _raw_v92_probability(vals, mask)
-    iso, wf_raw, wf_y = _walkforward_calibration(vals, mask)
+    vals = vals[-V93_WINDOW:]
+    raw_p, components, votes, pmeta = _v93_raw_ensemble(vals)
+    iso, wf_raw, wf_y = _v93_walkforward(vals)
     p_big = float(iso.predict([raw_p])[0]) if iso is not None else raw_p
 
-    predicted = "big" if p_big >= .5 else "small"
-    conf = p_big if predicted == "big" else 1-p_big
-    regime, choppy = _regime(vals)
-    entropy = _binary_entropy(sum(vals[-20:])/min(20,len(vals)))
-    support = len(wf_y)
+    predicted_big = p_big >= 0.5
+    predicted = "big" if predicted_big else "small"
+    conf = p_big if predicted_big else 1-p_big
 
-    component_votes = [
-        1 if components[0] >= .5 else 0,
-        1 if components[1] >= .5 else 0,
-        1 if components[2] >= .5 else 0,
-    ]
-    target_vote = 1 if predicted == "big" else 0
-    agreement = sum(v == target_vote for v in component_votes)
+    regime, choppy_score = _v93_regime(vals)
+    entropy20 = _v93_binary_entropy(sum(vals[-20:])/min(20, len(vals)))
+    transition_entropy = _v93_transition_entropy(vals[-30:])
+    switch_rate = _v93_switch_rate(vals[-20:])
+    stability = _v93_sequence_stability(vals)
 
-    threshold = V92_CHOPPY_THRESHOLD if regime == "CHOPPY" else V92_SIGNAL_THRESHOLD
+    agreement = sum((v == 1) == predicted_big for v in votes)
+    threshold = V93_CHOPPY_THRESHOLD if regime == "CHOPPY" else V93_STABLE_THRESHOLD
+
     reasons = []
-    if conf < threshold: reasons.append("confidence")
-    if entropy > V92_ENTROPY_STOP: reasons.append("entropy")
-    if support < 30: reasons.append("support")
-    if agreement < 2: reasons.append("agreement")
+    if conf < threshold:
+        reasons.append("confidence")
+    if entropy20 > V93_ENTROPY_STOP:
+        reasons.append("entropy")
+    if switch_rate > V93_SWITCH_RATE_STOP:
+        reasons.append("volatility")
+    if len(wf_y) < 30:
+        reasons.append("support")
+    if agreement < V93_MIN_AGREEMENT:
+        reasons.append("agreement")
+
     signal = "PREDICT" if not reasons else "SKIP"
 
-    # Honest walk-forward signal metrics using the same fixed confidence gates
-    # approximately; calibration is evaluated only on already-observed points.
+    # Honest historical coverage/accuracy estimate using the same strict base threshold.
     hits = preds = 0
     if iso is not None:
         for rp, y in zip(wf_raw, wf_y):
             cp = float(iso.predict([rp])[0])
-            pc = max(cp,1-cp)
-            if pc >= V92_SIGNAL_THRESHOLD:
+            pc = max(cp, 1-cp)
+            if pc >= V93_STABLE_THRESHOLD:
                 preds += 1
-                hits += int((cp>=.5) == bool(y))
-    accuracy = (hits/preds) if preds else None
+                hits += int((cp >= 0.5) == bool(y))
+    oos_acc = (hits/preds) if preds else None
     coverage = (preds/len(wf_y)) if wf_y else 0.0
 
     return {
         "ready": True,
+        "model": "V9.3 Flash",
         "prediction": predicted,
-        "p_big": round(p_big,4),
-        "calibrated_confidence": round(conf,4),
+        "p_big": round(p_big, 4),
+        "calibrated_confidence": round(conf, 4),
         "signal": signal,
         "skip_reasons": reasons,
         "regime": regime,
-        "choppy_score": round(choppy,4),
-        "entropy": round(entropy,4),
-        "sequence_stability": round(_sequence_stability(vals),4),
-        "agreement": f"{agreement}/3",
-        "support": support,
-        "rolling_oos_accuracy": None if accuracy is None else round(accuracy,4),
-        "rolling_oos_coverage": round(coverage,4),
-        "rolling_oos_predictions": preds,
-        "active_features": [n for n,k in zip(V92_FEATURE_NAMES,mask) if k],
-        "ablation_report": ablation,
-        "components": {
-            "logistic": round(components[0],4),
-            "markov": round(components[1],4),
-            "momentum": round(components[2],4),
-        },
         "threshold_used": threshold,
-        "model": "V9.2 Pro experimental size engine",
-        "note": "Confidence is walk-forward calibrated when enough support exists; no accuracy guarantee."
+        "choppy_score": round(choppy_score, 4),
+        "entropy20": round(entropy20, 4),
+        "transition_entropy": round(transition_entropy, 4),
+        "switch_rate": round(switch_rate, 4),
+        "sequence_stability": round(stability, 4),
+        "agreement": f"{agreement}/3",
+        "support": len(wf_y),
+        "rolling_oos_accuracy": None if oos_acc is None else round(oos_acc, 4),
+        "rolling_oos_coverage": round(coverage, 4),
+        "rolling_oos_predictions": preds,
+        "components": {
+            "trend_follower": round(components[0], 4),
+            "reversionist": round(components[1], 4),
+            "pattern_matcher": round(components[2], 4),
+        },
+        "pattern_meta": {
+            "markov": round(float(pmeta["markov"]), 4),
+            "ngram2_support": int(pmeta["ngram2_support"]),
+            "ngram3_support": int(pmeta["ngram3_support"]),
+        },
+        "features": {
+            "ema3": round(_v93_ema(vals[-30:], 3), 4),
+            "ema8": round(_v93_ema(vals[-50:], 8), 4),
+            "ema20": round(_v93_ema(vals[-80:], 20), 4),
+            "gap_since_big": int(_v93_gap_since(vals, 1)),
+            "gap_since_small": int(_v93_gap_since(vals, 0)),
+            "gap_to_mean_10": round(0.5 - sum(vals[-10:])/10.0, 4),
+        },
+        "note": "Strict experimental research signal. Accuracy is measured walk-forward; thresholds do not guarantee a target hit-rate."
+    }
+
+
+
+# ============================================================
+# V9.3 VIRTUAL PKR SIMULATOR
+# Historical/backtest only. No live bet placement or wallet integration.
+# ============================================================
+
+def simulate_v93_virtual_balance(
+    games,
+    starting_balance: float,
+    target_balance: float,
+    stake_percent: float = 0.02,
+    max_rounds: int = 200,
+):
+    starting_balance = float(max(starting_balance, 1.0))
+    target_balance = float(max(target_balance, starting_balance))
+    stake_percent = float(np.clip(stake_percent, 0.001, 0.05))
+    max_rounds = int(np.clip(max_rounds, 1, 1000))
+
+    ordered = list(reversed(games))
+    usable = [g for g in ordered if str(g.get("size","")).lower() in ("big","small")]
+    if len(usable) < V93_MIN_TRAIN + 1:
+        return {
+            "ready": False,
+            "reason": f"need at least {V93_MIN_TRAIN + 1} completed rounds",
+            "starting_balance_pkr": round(starting_balance, 2),
+            "target_balance_pkr": round(target_balance, 2),
+        }
+
+    balance = starting_balance
+    peak = balance
+    lowest = balance
+    start_i = max(V93_MIN_TRAIN, len(usable) - max_rounds)
+    rows = []
+    predictions = wins = losses = skips = 0
+    stop_reason = "history_exhausted"
+
+    for i in range(start_i, len(usable)):
+        # Only information available before this historical round is used.
+        train_games = list(reversed(usable[:i]))
+        result = build_v93_flash(train_games)
+        actual = str(usable[i]["size"]).lower()
+
+        if not result.get("ready") or result.get("signal") != "PREDICT":
+            skips += 1
+            rows.append({
+                "issue": str(usable[i].get("issue","")),
+                "action": "SKIP",
+                "actual": actual,
+                "balance_pkr": round(balance, 2),
+            })
+            continue
+
+        prediction = str(result["prediction"]).lower()
+        confidence = float(result.get("calibrated_confidence", 0.5))
+
+        # Virtual fixed-fraction stake. This is deliberately capped and does
+        # not use Kelly/Martingale or any live-wallet logic.
+        virtual_stake = min(balance * stake_percent, max(balance, 0.0))
+        won = prediction == actual
+
+        if won:
+            balance += virtual_stake
+            wins += 1
+        else:
+            balance -= virtual_stake
+            losses += 1
+        predictions += 1
+
+        peak = max(peak, balance)
+        lowest = min(lowest, balance)
+
+        rows.append({
+            "issue": str(usable[i].get("issue","")),
+            "prediction": prediction,
+            "actual": actual,
+            "confidence": round(confidence, 4),
+            "virtual_stake_pkr": round(virtual_stake, 2),
+            "result": "WIN" if won else "LOSS",
+            "balance_pkr": round(balance, 2),
+        })
+
+        if balance >= target_balance:
+            stop_reason = "target_reached"
+            break
+        if balance <= 0.01:
+            balance = 0.0
+            stop_reason = "virtual_balance_depleted"
+            break
+
+    hit_rate = (wins / predictions) if predictions else None
+    pnl = balance - starting_balance
+    return {
+        "ready": True,
+        "mode": "historical_virtual_simulation_only",
+        "currency": "PKR",
+        "starting_balance_pkr": round(starting_balance, 2),
+        "target_balance_pkr": round(target_balance, 2),
+        "ending_balance_pkr": round(balance, 2),
+        "max_balance_reached_pkr": round(peak, 2),
+        "min_balance_reached_pkr": round(lowest, 2),
+        "profit_loss_pkr": round(pnl, 2),
+        "return_percent": round((pnl / starting_balance) * 100.0, 2),
+        "virtual_stake_percent": round(stake_percent * 100.0, 2),
+        "predictions": predictions,
+        "wins": wins,
+        "losses": losses,
+        "skips": skips,
+        "hit_rate": None if hit_rate is None else round(hit_rate, 4),
+        "stop_reason": stop_reason,
+        "rounds_processed": len(rows),
+        "history": rows[-250:],
+        "note": "Backtest with virtual PKR only. It does not place bets or control a real wallet."
     }
 
 
 app = FastAPI(
     title="WinGo Statistical Predictor API",
-    version="9.2.0",
+    version="9.3.0",
     lifespan=lifespan,
 )
 
@@ -1622,7 +1746,7 @@ app.add_middleware(
 def root():
     return {
         "name": "WinGo Statistical Predictor API",
-        "version": "9.2.0",
+        "version": "9.3.0",
         "status": "online",
         "docs": "/docs",
     }
@@ -1673,10 +1797,27 @@ class RoundInput(BaseModel):
     secret: str
 
 
-@app.get("/api/v9.2/pro")
-def v92_pro():
+@app.get("/api/v9.3/flash")
+def v93_flash():
     history = engine.load_history(HISTORY_LIMIT)
-    return build_v92_pro(history)
+    return build_v93_flash(history)
+
+
+@app.get("/api/v9.3/simulate")
+def v93_simulate(
+    starting_balance: float = Query(..., gt=0, le=100000000),
+    target_balance: float = Query(..., gt=0, le=1000000000),
+    stake_percent: float = Query(2.0, ge=0.1, le=5.0),
+    max_rounds: int = Query(200, ge=1, le=1000),
+):
+    history = engine.load_history(max(HISTORY_LIMIT, max_rounds + V93_MIN_TRAIN + 20))
+    return simulate_v93_virtual_balance(
+        history,
+        starting_balance=starting_balance,
+        target_balance=target_balance,
+        stake_percent=stake_percent / 100.0,
+        max_rounds=max_rounds,
+    )
 
 
 @app.post("/api/ingest")

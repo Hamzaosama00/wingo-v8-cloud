@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>V9.3 Virtual PKR Simulator</title>
+<style>
+body{font-family:system-ui;background:#07111f;color:#fff;margin:0;padding:24px}
+main{max-width:900px;margin:auto}
+.card{background:#0d1b2d;border:1px solid #1f3048;border-radius:16px;padding:18px;margin:14px 0}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}
+label{display:block;font-size:13px;color:#b7c6dc;margin-bottom:6px}
+input{width:100%;box-sizing:border-box;padding:11px;border-radius:9px;border:1px solid #334865;background:#091525;color:#fff}
+button{padding:12px 18px;border:0;border-radius:10px;font-weight:700;cursor:pointer}
+pre{white-space:pre-wrap;overflow:auto}
+.k{font-size:12px;color:#9fb0c9}.v{font-size:24px;font-weight:800}
+</style>
+</head>
+<body><main>
+<h1>V9.3 Virtual PKR Simulator</h1>
+<p>Historical simulation only — no live wallet or bet placement.</p>
+<div class="card grid">
+<div><label>Backend URL</label><input id="backend" value="https://wingo-v8-cloud.onrender.com"></div>
+<div><label>Starting Balance (PKR)</label><input id="start" type="number" min="1" value="1000"></div>
+<div><label>Target Balance (PKR)</label><input id="target" type="number" min="1" value="1500"></div>
+<div><label>Virtual Stake %</label><input id="stake" type="number" min="0.1" max="5" step="0.1" value="2"></div>
+<div><label>Max Historical Rounds</label><input id="rounds" type="number" min="1" max="1000" value="200"></div>
+</div>
+<button id="run">Run Simulation</button>
+<div class="card grid" id="summary">
+<div><div class="k">Ending Balance</div><div class="v" id="end">—</div></div>
+<div><div class="k">Max Balance</div><div class="v" id="peak">—</div></div>
+<div><div class="k">P/L</div><div class="v" id="pnl">—</div></div>
+<div><div class="k">Hit Rate</div><div class="v" id="hit">—</div></div>
+</div>
+<div class="card"><pre id="out">Enter values and run.</pre></div>
+<script>
+const $=id=>document.getElementById(id);
+$("run").addEventListener("click",async()=>{
+  const b=$("backend").value.replace(/\/$/,"");
+  const qs=new URLSearchParams({
+    starting_balance:$("start").value,
+    target_balance:$("target").value,
+    stake_percent:$("stake").value,
+    max_rounds:$("rounds").value
+  });
+  $("out").textContent="Running...";
+  try{
+    const r=await fetch(b+"/api/v9.3/simulate?"+qs.toString());
+    const d=await r.json();
+    $("end").textContent=d.ending_balance_pkr!=null?"₨ "+d.ending_balance_pkr:"—";
+    $("peak").textContent=d.max_balance_reached_pkr!=null?"₨ "+d.max_balance_reached_pkr:"—";
+    $("pnl").textContent=d.profit_loss_pkr!=null?"₨ "+d.profit_loss_pkr:"—";
+    $("hit").textContent=d.hit_rate!=null?(d.hit_rate*100).toFixed(1)+"%":"—";
+    $("out").textContent=JSON.stringify(d,null,2);
+  }catch(e){$("out").textContent=String(e)}
+});
+</script>
+</main></body></html>

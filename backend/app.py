@@ -46,15 +46,21 @@ HEADERS = {
     "Referer": REFERER_HEADER,
 }
 
+
 FIREBASE_PROJECT_ID = os.getenv("FIREBASE_PROJECT_ID", "").strip()
 FIREBASE_CREDENTIALS = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
 
 def get_firestore():
     if not firebase_admin._apps:
         if FIREBASE_CREDENTIALS:
-            firebase_admin.initialize_app(credentials.Certificate(FIREBASE_CREDENTIALS), {"projectId": FIREBASE_PROJECT_ID} if FIREBASE_PROJECT_ID else None)
+            firebase_admin.initialize_app(
+                credentials.Certificate(FIREBASE_CREDENTIALS),
+                {"projectId": FIREBASE_PROJECT_ID} if FIREBASE_PROJECT_ID else None,
+            )
         else:
-            firebase_admin.initialize_app(options={"projectId": FIREBASE_PROJECT_ID} if FIREBASE_PROJECT_ID else None)
+            firebase_admin.initialize_app(
+                options={"projectId": FIREBASE_PROJECT_ID} if FIREBASE_PROJECT_ID else None
+            )
     return firestore.client()
 
 
@@ -143,6 +149,8 @@ class PredictorEngine:
             }
             if "predicted_number" not in columns:
                 conn.execute("ALTER TABLE predictions ADD COLUMN predicted_number INTEGER")
+            if "actual_number" not in columns:
+                conn.execute("ALTER TABLE predictions ADD COLUMN actual_number INTEGER")
 
             conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_rounds_seen_at
@@ -177,6 +185,43 @@ class PredictorEngine:
         with self._connect() as conn:
             row = conn.execute("SELECT COUNT(*) AS c FROM rounds").fetchone()
             return int(row["c"])
+
+    def save_round_cloud(self, game: Dict[str, Any]) -> None:
+        payload = dict(game)
+        payload["seen_at"] = int(payload.get("seen_at") or time.time())
+        get_firestore().collection("rounds").document(str(game["issue"])).set(payload, merge=True)
+
+    def hydrate_from_firestore(self, limit: int = HISTORY_LIMIT) -> int:
+        """Rebuild ephemeral SQLite from permanent Firestore history."""
+        docs = list(
+            get_firestore().collection("rounds")
+            .order_by("issue", direction=firestore.Query.DESCENDING)
+            .limit(limit)
+            .stream()
+        )
+        restored = 0
+        # Save oldest -> newest so local state is naturally ordered.
+        for doc in reversed(docs):
+            data = doc.to_dict() or {}
+            try:
+                game = {
+                    "issue": str(data.get("issue") or doc.id),
+                    "number": int(data["number"]),
+                    "color": str(data["color"]),
+                    "size": str(data.get("size") or ("big" if int(data["number"]) >= 5 else "small")),
+                    "parity": str(data.get("parity") or ("even" if int(data["number"]) % 2 == 0 else "odd")),
+                }
+                if self.save_round(game):
+                    restored += 1
+            except Exception:
+                continue
+        return restored
+
+    def save_prediction_cloud(self, prediction: Optional[Dict[str, Any]]) -> None:
+        if not prediction:
+            return
+        payload = {k: v for k, v in prediction.items() if v is not None}
+        get_firestore().collection("predictions").document(str(prediction["issue"])).set(payload, merge=True)
 
     def load_history(self, limit: int = HISTORY_LIMIT) -> List[Dict[str, Any]]:
         with self._connect() as conn:
@@ -702,83 +747,198 @@ class PredictorEngine:
                 scores[value] += 1.0
         return self.normalize(scores, NUMBER_STATES)
 
+    @staticmethod
+    def dynamic_window_for_sequence(sequence: Sequence[int]) -> Tuple[int, float, str]:
+        """Shorter lookback in choppy sequences; longer in stable sequences."""
+        seq = list(sequence)
+        if len(seq) < 3:
+            return min(len(seq), 50), 0.5, "normal"
+        recent = seq[-30:]
+        changes = sum(1 for a, b in zip(recent, recent[1:]) if a != b)
+        volatility = changes / max(len(recent) - 1, 1)
+        if volatility < 0.60:
+            return min(len(seq), 200), volatility, "stable"
+        if volatility > 0.88:
+            return min(len(seq), 40), volatility, "choppy"
+        return min(len(seq), 100), volatility, "normal"
+
+    def higher_order_markov_distribution(
+        self, sequence: Sequence[int], max_order: int = 3
+    ) -> Tuple[Dict[int, float], int, int]:
+        seq = list(sequence)
+        if len(seq) < 3:
+            return self.normalize({n: 1.0 for n in NUMBER_STATES}, NUMBER_STATES), 0, 0
+        for order in range(min(max_order, len(seq)-1), 0, -1):
+            ctx = tuple(seq[-order:])
+            scores = {n: 1.0 for n in NUMBER_STATES}
+            support = 0
+            for i in range(len(seq)-order):
+                if tuple(seq[i:i+order]) == ctx:
+                    nxt = seq[i+order]
+                    if nxt in scores:
+                        scores[nxt] += 1.0
+                        support += 1
+            if support >= (2 if order > 1 else 1):
+                return self.normalize(scores, NUMBER_STATES), support, order
+        return self.normalize({n: 1.0 for n in NUMBER_STATES}, NUMBER_STATES), 0, 0
+
+    def lag_distribution(self, sequence: Sequence[int], lags: Sequence[int] = (5, 10)) -> Tuple[Dict[int, float], float]:
+        """Empirical lag repeat/transition evidence. Does not assume cycles exist."""
+        seq = list(sequence)
+        scores = {n: 1.0 for n in NUMBER_STATES}
+        strengths = []
+        for lag in lags:
+            if len(seq) <= lag:
+                continue
+            matches = sum(int(seq[i] == seq[i-lag]) for i in range(lag, len(seq)))
+            strengths.append(matches / max(len(seq)-lag, 1))
+            anchor = seq[-lag]
+            for i in range(lag, len(seq)-1):
+                if seq[i-lag] == anchor:
+                    scores[seq[i]] += 0.5
+        return self.normalize(scores, NUMBER_STATES), (sum(strengths)/len(strengths) if strengths else 0.0)
+
+    def zscore_reversion_distribution(self, sequence: Sequence[int], window: int = 60) -> Tuple[Dict[int, float], Dict[int, float]]:
+        """Frequency deviation diagnostic with a deliberately weak reversion prior."""
+        seq = list(sequence)[-window:]
+        n = max(len(seq), 1)
+        expected = n / 10.0
+        sd = math.sqrt(max(n * 0.1 * 0.9, 1e-9))
+        counts = {x: seq.count(x) for x in NUMBER_STATES}
+        z = {x: (counts[x]-expected)/sd for x in NUMBER_STATES}
+        # Underrepresented digits receive only a mild boost; this is not a gambler's-fallacy claim.
+        scores = {x: math.exp(max(-2.0, min(2.0, -0.20*z[x]))) for x in NUMBER_STATES}
+        return self.normalize(scores, NUMBER_STATES), z
+
+    def momentum_distribution(self, sequence: Sequence[int]) -> Tuple[Dict[int, float], float]:
+        """Measures recent persistence in derived size/parity; kept weak."""
+        seq=list(sequence)
+        scores={n:1.0 for n in NUMBER_STATES}
+        if len(seq)<6:
+            return self.normalize(scores, NUMBER_STATES), 0.0
+        sizes=[1 if n>=5 else 0 for n in seq[-20:]]
+        recent=sum(1 for a,b in zip(sizes[-6:],sizes[-5:]) if a==b)/5.0
+        prior_pairs=list(zip(sizes[:-6],sizes[1:-5]))
+        prior=(sum(1 for a,b in prior_pairs if a==b)/len(prior_pairs)) if prior_pairs else 0.5
+        momentum=recent-prior
+        desired=sizes[-1] if momentum>0 else 1-sizes[-1]
+        for n in NUMBER_STATES:
+            if (1 if n>=5 else 0)==desired:
+                scores[n]+=min(abs(momentum),0.5)
+        return self.normalize(scores, NUMBER_STATES), momentum
+
     def candidate_number_distributions(self, sequence: Sequence[int]) -> Dict[str, Dict[int, float]]:
-        ema = self.ema_distribution(sequence, NUMBER_STATES)
-        markov, _ = self.markov_distribution(sequence, NUMBER_STATES)
-        pattern, _, _ = self.ngram_distribution(sequence, NUMBER_STATES, max_order=3)
-        freq = self.frequency_number_distribution(sequence)
-        return {"ema": ema, "markov": markov, "pattern": pattern, "frequency": freq}
+        seq=list(sequence)
+        window, _, _ = self.dynamic_window_for_sequence(seq)
+        seq=seq[-window:] if window else seq
+        ema = self.ema_distribution(seq, NUMBER_STATES)
+        markov, _, _ = self.higher_order_markov_distribution(seq, max_order=3)
+        pattern, _, _ = self.ngram_distribution(seq, NUMBER_STATES, max_order=3)
+        freq = self.frequency_number_distribution(seq, window=window or 100)
+        lag, _ = self.lag_distribution(seq)
+        zscore, _ = self.zscore_reversion_distribution(seq)
+        momentum, _ = self.momentum_distribution(seq)
+        return {
+            "ema": ema, "markov": markov, "pattern": pattern, "frequency": freq,
+            "lag": lag, "zscore": zscore, "momentum": momentum,
+        }
 
     def walk_forward_model_scores(
         self,
         sequence: Sequence[int],
-        lookback: int = 80,
+        lookback: int = 100,
         min_train: int = 30,
     ) -> Dict[str, Dict[str, float]]:
-        names = ("ema", "markov", "pattern", "frequency")
-        stats = {name: {"correct": 0.0, "tested": 0.0, "logloss": 0.0} for name in names}
-
-        start = max(min_train, len(sequence) - lookback)
-        for target_index in range(start, len(sequence)):
-            train = list(sequence[:target_index])
-            actual = int(sequence[target_index])
-            candidates = self.candidate_number_distributions(train)
-
-            for name, dist in candidates.items():
-                predicted = max(dist, key=dist.get)
-                stats[name]["tested"] += 1.0
-                stats[name]["correct"] += float(predicted == actual)
-                stats[name]["logloss"] += -math.log(max(float(dist.get(actual, 0.0)), 1e-9))
+        names = ("ema","markov","pattern","frequency","lag","zscore","momentum")
+        stats = {
+            name: {
+                "correct":0.0, "tested":0.0, "logloss":0.0,
+                "weighted_logloss":0.0,
+                "stable_correct":0.0, "stable_tested":0.0,
+                "normal_correct":0.0, "normal_tested":0.0,
+                "choppy_correct":0.0, "choppy_tested":0.0,
+            } for name in names
+        }
+        start=max(min_train,len(sequence)-lookback)
+        for target_index in range(start,len(sequence)):
+            train=list(sequence[:target_index])
+            actual=int(sequence[target_index])
+            _, _, regime=self.dynamic_window_for_sequence(train)
+            candidates=self.candidate_number_distributions(train)
+            for name,dist in candidates.items():
+                predicted=max(dist,key=dist.get)
+                p=max(float(dist.get(actual,0.0)),1e-9)
+                peak=max(float(v) for v in dist.values())
+                loss=-math.log(p)
+                # Confident distributions are penalized more when wrong.
+                penalty=1.0 + (2.0*max(0.0,peak-0.10) if predicted!=actual else 0.0)
+                s=stats[name]
+                s["tested"]+=1.0
+                s["correct"]+=float(predicted==actual)
+                s["logloss"]+=loss
+                s["weighted_logloss"]+=loss*penalty
+                s[f"{regime}_tested"]+=1.0
+                s[f"{regime}_correct"]+=float(predicted==actual)
 
         for name in names:
-            tested = stats[name]["tested"]
+            s=stats[name]; tested=s["tested"]
             if tested:
-                stats[name]["accuracy"] = stats[name]["correct"] / tested
-                stats[name]["logloss"] /= tested
+                s["accuracy"]=s["correct"]/tested
+                s["logloss"]/=tested
+                s["weighted_logloss"]/=tested
             else:
-                stats[name]["accuracy"] = 0.10
-                stats[name]["logloss"] = math.log(10.0)
+                s["accuracy"]=0.10
+                s["logloss"]=s["weighted_logloss"]=math.log(10.0)
+            for regime in ("stable","normal","choppy"):
+                t=s[f"{regime}_tested"]
+                s[f"{regime}_accuracy"]=(s[f"{regime}_correct"]/t) if t else None
         return stats
 
     def adaptive_number_weights(self, sequence: Sequence[int]) -> Tuple[Dict[str, float], Dict[str, Dict[str, float]]]:
-        stats = self.walk_forward_model_scores(sequence)
-        raw = {}
-
-        # Weight by out-of-sample probability quality, not in-sample fit.
-        # exp(-logloss) is bounded and avoids a lucky tiny sample dominating.
-        for name, row in stats.items():
-            tested = max(row["tested"], 1.0)
-            reliability = min(tested / 50.0, 1.0)
-            quality = math.exp(-float(row["logloss"]))
-            raw[name] = 0.05 + reliability * quality
-
-        total = sum(raw.values())
-        return ({name: value / total for name, value in raw.items()}, stats)
+        stats=self.walk_forward_model_scores(sequence)
+        _,_,current_regime=self.dynamic_window_for_sequence(sequence)
+        raw={}
+        for name,row in stats.items():
+            tested=max(row["tested"],1.0)
+            reliability=min(tested/60.0,1.0)
+            quality=math.exp(-float(row["weighted_logloss"]))
+            rt=row.get(f"{current_regime}_tested",0.0)
+            ra=row.get(f"{current_regime}_accuracy")
+            regime_factor=1.0
+            if rt>=10 and ra is not None:
+                regime_factor=0.75+min(max(float(ra)/0.10,0.5),1.5)*0.25
+            raw[name]=0.02+reliability*quality*regime_factor
+        total=sum(raw.values())
+        return ({n:v/total for n,v in raw.items()},stats)
 
     def predict_number(self, games: List[Dict[str, Any]]) -> Dict[str, Any]:
-        sequence = [int(game["number"]) for game in games]
-        candidates = self.candidate_number_distributions(sequence)
-        weights, backtest = self.adaptive_number_weights(sequence)
-
-        distribution = {
-            n: sum(weights[name] * candidates[name][n] for name in candidates)
-            for n in NUMBER_STATES
-        }
-        distribution = self.normalize(distribution, NUMBER_STATES)
-        ordered = sorted(distribution.items(), key=lambda item: item[1], reverse=True)
-
-        prediction = int(ordered[0][0])
-        score = float(ordered[0][1])
-        margin = score - float(ordered[1][1])
-
+        full_sequence=[int(game["number"]) for game in games]
+        window,adaptive_volatility,adaptive_regime=self.dynamic_window_for_sequence(full_sequence)
+        sequence=full_sequence[-window:] if window else full_sequence
+        candidates=self.candidate_number_distributions(sequence)
+        weights,backtest=self.adaptive_number_weights(sequence)
+        distribution={n:sum(weights[name]*candidates[name][n] for name in candidates) for n in NUMBER_STATES}
+        distribution=self.normalize(distribution,NUMBER_STATES)
+        ordered=sorted(distribution.items(),key=lambda item:item[1],reverse=True)
+        prediction=int(ordered[0][0]); score=float(ordered[0][1]); margin=score-float(ordered[1][1])
+        entropy=self.normalized_entropy(distribution)
+        _,z=self.zscore_reversion_distribution(sequence)
+        _,lag_strength=self.lag_distribution(sequence)
+        _,momentum=self.momentum_distribution(sequence)
+        # Calibrated evidence score, not a claimed win probability.
+        evidence=max(0.0,min(1.0,
+            0.35*(1.0-entropy) +
+            0.30*min(margin/0.12,1.0) +
+            0.20*min(max((score-0.10)/0.15,0.0),1.0) +
+            0.15*min(max(lag_strength-0.10,0.0)/0.20,1.0)
+        ))
         return {
-            "prediction": prediction,
-            "score": score,
-            "margin": margin,
-            "entropy": self.normalized_entropy(distribution),
-            "distribution": distribution,
-            "weights": weights,
-            "backtest": backtest,
+            "prediction":prediction,"score":score,"margin":margin,"entropy":entropy,
+            "distribution":distribution,"weights":weights,"backtest":backtest,
+            "adaptive_window":window,"adaptive_volatility":adaptive_volatility,
+            "adaptive_regime":adaptive_regime,"z_scores":z,
+            "lag_strength":lag_strength,"momentum":momentum,
+            "confidence":evidence,
         }
 
     # ---------------------------------------------------------
@@ -834,52 +994,37 @@ class PredictorEngine:
         return "MEDIUM"
 
     def build_prediction(self, games: List[Dict[str, Any]]) -> Dict[str, Any]:
-        number = self.predict_number(games)
-        color_value, size_value, parity_value = self.features_from_number(number["prediction"])
+        number=self.predict_number(games)
+        color_value,size_value,parity_value=self.features_from_number(number["prediction"])
+        color=self.predict_feature(games,"color",COLOR_STATES)
+        size=self.predict_feature(games,"size",SIZE_STATES)
+        parity=self.predict_feature(games,"parity",PARITY_STATES)
+        joint_state=(color_value,size_value,parity_value)
+        agreement=self.agreement_count(joint_state,color["prediction"],size["prediction"],parity["prediction"])
 
-        # Keep the old feature models only as diagnostics/agreement checks.
-        color = self.predict_feature(games, "color", COLOR_STATES)
-        size = self.predict_feature(games, "size", SIZE_STATES)
-        parity = self.predict_feature(games, "parity", PARITY_STATES)
+        # V8.3: strict signal/noise gate. "confidence" is an evidence score,
+        # not a guaranteed probability of the next outcome.
+        confidence=float(number["confidence"])
+        entropy=float(number["entropy"])
+        margin=float(number["margin"])
+        signal="SKIP"
+        if confidence >= 0.70 and margin >= 0.035 and entropy <= 0.82 and agreement >= 2:
+            signal="MEDIUM"
+        if confidence >= 0.82 and margin >= 0.060 and entropy <= 0.72 and agreement == 3:
+            signal="HIGH"
 
-        joint_state = (color_value, size_value, parity_value)
-        agreement = self.agreement_count(
-            joint_state,
-            color["prediction"],
-            size["prediction"],
-            parity["prediction"],
-        )
-
-        # V7 confidence is deliberately conservative. A ten-way digit model
-        # should not claim HIGH confidence from a small sample.
-        signal = "SKIP"
-        if number["score"] >= 0.18 and number["margin"] >= 0.025 and agreement >= 2:
-            signal = "MEDIUM"
-
-        joint = {
-            "prediction": joint_state,
-            "score": number["score"],
-            "margin": number["margin"],
-            "entropy": number["entropy"],
-            "distribution": {},
-            "weights": number["weights"],
-            "total_support": len(games),
-            "volatility": self.combined_volatility(games),
-            "regime": self.regime_from_volatility(self.combined_volatility(games)),
-            "number_prediction": number["prediction"],
-            "number_distribution": number["distribution"],
-            "backtest": number["backtest"],
+        volatility=self.combined_volatility(games)
+        joint={
+            "prediction":joint_state,"score":number["score"],"margin":margin,
+            "entropy":entropy,"distribution":{},"weights":number["weights"],
+            "total_support":len(games),"volatility":volatility,
+            "regime":number["adaptive_regime"],"number_prediction":number["prediction"],
+            "number_distribution":number["distribution"],"backtest":number["backtest"],
+            "confidence":confidence,"adaptive_window":number["adaptive_window"],
+            "z_scores":number["z_scores"],"lag_strength":number["lag_strength"],
+            "momentum":number["momentum"],
         }
-
-        return {
-            "joint": joint,
-            "number": number,
-            "color": color,
-            "size": size,
-            "parity": parity,
-            "agreement": agreement,
-            "signal": signal,
-        }
+        return {"joint":joint,"number":number,"color":color,"size":size,"parity":parity,"agreement":agreement,"signal":signal}
 
     # ---------------------------------------------------------
     # Save / verify predictions
@@ -1002,6 +1147,7 @@ class PredictorEngine:
                     UPDATE predictions
                     SET
                         verified = 1,
+                        actual_number = ?,
                         actual_color = ?,
                         actual_size = ?,
                         actual_parity = ?,
@@ -1011,6 +1157,7 @@ class PredictorEngine:
                         parity_win = ?
                     WHERE issue = ?
                 """, (
+                    actual["number"],
                     actual["color"],
                     actual["size"],
                     actual["parity"],
@@ -1283,7 +1430,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="WinGo Statistical Predictor API",
-    version="8.0.0",
+    version="8.3.0",
     lifespan=lifespan,
 )
 
@@ -1311,7 +1458,7 @@ app.add_middleware(
 def root():
     return {
         "name": "WinGo Statistical Predictor API",
-        "version": "8.0.0",
+        "version": "8.1.0",
         "status": "online",
         "docs": "/docs",
     }
@@ -1345,6 +1492,45 @@ def history(limit: int = 30):
 def predictions(limit: int = 30):
     return {
         "items": engine.recent_predictions(limit),
+    }
+
+
+
+@app.get("/api/compare")
+def compare_predictions(limit: int = 50):
+    limit = max(1, min(limit, 200))
+    engine.verify_pending_predictions()
+    with engine._connect() as conn:
+        rows = conn.execute("""
+            SELECT
+                issue, based_on_issue, predicted_number,
+                predicted_color, predicted_size, predicted_parity,
+                signal, joint_score, created_at, verified,
+                actual_number, actual_color, actual_size, actual_parity,
+                joint_win, color_win, size_win, parity_win
+            FROM predictions
+            ORDER BY created_at DESC
+            LIMIT ?
+        """, (limit,)).fetchall()
+
+    items = []
+    verified = wins = 0
+    for r in rows:
+        x = dict(r)
+        if x["verified"]:
+            verified += 1
+            wins += int(x["joint_win"] or 0)
+            x["result"] = "WIN" if x["joint_win"] else "LOSS"
+        else:
+            x["result"] = "PENDING"
+        items.append(x)
+
+    return {
+        "model_version": "8.3",
+        "verified": verified,
+        "joint_wins": wins,
+        "joint_accuracy": round((wins / verified * 100), 2) if verified else None,
+        "items": items,
     }
 
 
@@ -1382,26 +1568,42 @@ def ingest_round(round_data: RoundInput):
         "parity": "even" if number % 2 == 0 else "odd",
     }
 
+    firebase_error = None
+    restored = 0
+
+    # Firestore is permanent storage. Render's local SQLite is only a fast cache.
+    try:
+        # A fresh/restarted Render instance has an empty ephemeral DB.
+        if engine.count_rounds() == 0:
+            restored = engine.hydrate_from_firestore(HISTORY_LIMIT)
+    except Exception as exc:
+        firebase_error = f"hydrate: {type(exc).__name__}: {exc}"
+
     inserted = engine.save_round(game)
+
+    # Persist the completed/public round before doing model work.
+    try:
+        engine.save_round_cloud(game)
+    except Exception as exc:
+        firebase_error = f"round-write: {type(exc).__name__}: {exc}"
+
     engine.verify_pending_predictions()
     history = engine.load_history(HISTORY_LIMIT)
     prediction = engine.save_next_prediction(history) if inserted else None
 
-    firebase_error = None
-    if inserted:
-        try:
-            db = get_firestore()
-            db.collection("rounds").document(game["issue"]).set(game, merge=True)
-            if prediction:
-                db.collection("predictions").document(str(prediction["issue"])).set({k:v for k,v in prediction.items() if v is not None}, merge=True)
-        except Exception as exc:
-            firebase_error = f"{type(exc).__name__}: {exc}"
+    try:
+        engine.save_prediction_cloud(prediction)
+    except Exception as exc:
+        firebase_error = f"prediction-write: {type(exc).__name__}: {exc}"
 
     return {
         "ok": True,
         "inserted": inserted,
         "round": game,
         "stored_rounds": engine.count_rounds(),
+        "restored_from_firestore": restored,
         "prediction": prediction,
         "firebase_error": firebase_error,
+        "storage": "firestore-primary/sqlite-cache",
+        "model_version": "8.3",
     }

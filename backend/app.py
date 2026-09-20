@@ -1,6 +1,12 @@
 from __future__ import annotations
 
 import json, math, os, sqlite3, threading, time
+
+# Keep BLAS / sklearn from spawning many threads on small Render instances.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -23,13 +29,15 @@ except Exception:
     service_account = None
     GoogleAuthRequest = None
 
-APP_VERSION = "9.0.0"
-MODEL_VERSION = "v9.0-research"
+APP_VERSION = "9.1.0"
+MODEL_VERSION = "v9.1-nonblocking"
 DB_PATH = os.getenv("DB_PATH", "wingo_v9.db")
 INGEST_SECRET = os.getenv("INGEST_SECRET", "")
 FIREBASE_PROJECT_ID = os.getenv("FIREBASE_PROJECT_ID", "").strip()
 GOOGLE_APPLICATION_CREDENTIALS = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
-HISTORY_LIMIT = max(300, int(os.getenv("HISTORY_LIMIT", "1200")))
+HISTORY_LIMIT = max(300, int(os.getenv("HISTORY_LIMIT", "600")))
+LIVE_TRAIN_LIMIT = max(150, int(os.getenv("V9_LIVE_TRAIN_LIMIT", "350")))
+FULL_EVAL_EVERY = max(5, int(os.getenv("V9_FULL_EVAL_EVERY", "25")))
 MIN_TRAIN = max(60, int(os.getenv("V9_MIN_TRAIN", "100")))
 BACKTEST_BLOCK = max(20, int(os.getenv("V9_BACKTEST_BLOCK", "50")))
 EMBARGO = max(0, int(os.getenv("V9_EMBARGO", "20")))
@@ -41,7 +49,9 @@ DB_LOCK = threading.RLock()
 MODEL_LOCK = threading.RLock()
 _FIRESTORE = None
 _FIRESTORE_LOCK = threading.Lock()
-MODEL_CACHE: Dict[str, Any] = {"history_issue": None, "prediction": None, "report": None, "ablation": None}
+MODEL_CACHE: Dict[str, Any] = {"history_issue": None, "prediction": None, "report": None, "ablation": None, "calibrator": None}
+TRAIN_LOCK = threading.Lock()
+TRAIN_STATE: Dict[str, Any] = {"running": False, "pending": False, "pending_full": False, "last_started": None, "last_finished": None, "last_error": None, "last_mode": None}
 
 
 def size_from_number(n: int) -> str: return "big" if int(n) >= 5 else "small"
@@ -405,26 +415,164 @@ def feature_contributions(m,x):
     return sorted(out,key=lambda r:abs(r["contribution"]),reverse=True)[:10]
 
 
-def build_v9_prediction(rounds):
-    if not rounds:return {"ready":False,"reason":"no_history","model_version":MODEL_VERSION}
+def build_v9_prediction(rounds, full_eval=False):
+    if not rounds:
+        return {"ready":False,"reason":"no_history","model_version":MODEL_VERSION}
+
     target=increment_issue(rounds[-1]["issue"])
-    if len(rounds)<max(40,MIN_TRAIN//2):return {"ready":False,"reason":"insufficient_history","history":len(rounds),"minimum":max(40,MIN_TRAIN//2),"issue":target,"model_version":MODEL_VERSION}
-    X,y,_=build_dataset(rounds)
+    if len(rounds)<max(40,MIN_TRAIN//2):
+        return {"ready":False,"reason":"insufficient_history","history":len(rounds),"minimum":max(40,MIN_TRAIN//2),"issue":target,"model_version":MODEL_VERSION}
+
+    # Live fit uses only a bounded recent window so ingest never triggers an
+    # expensive full-history rebuild on the request thread.
+    live_rounds=rounds[-min(LIVE_TRAIN_LIMIT,len(rounds)):]
+    X,y,_=build_dataset(live_rounds)
+
     with MODEL_LOCK:
-        m=fit_models(X,y); f=build_features(rounds,target); x=features_to_vector(f); e=ensemble_probability(m,x,rounds); report=walk_forward_report(rounds); iso=report.get("calibrator"); p_raw=e["p_big_raw"];p_cal=apply_iso(iso,p_raw)
-        predicted="big" if p_cal>=.5 else "small"; conf=max(p_cal,1-p_cal); regime=current_regime(rounds); reasons=[]; signal="PREDICT"
-        if conf<SIGNAL_THRESHOLD:signal="SKIP";reasons.append("confidence_below_threshold")
-        if int(report.get("samples") or 0)<50:signal="SKIP";reasons.append("insufficient_out_of_sample_support")
-        if regime=="HIGH_ENTROPY" and conf<max(.65,SIGNAL_THRESHOLD):signal="SKIP";reasons.append("high_entropy_regime")
-        if e["agreement"]<2:signal="SKIP";reasons.append("low_model_agreement")
-        pred={"ready":True,"issue":target,"created_at":time.time(),"model_version":MODEL_VERSION,"predicted_size":predicted,"p_big_raw":p_raw,"p_big_calibrated":p_cal,"confidence":conf,"threshold":SIGNAL_THRESHOLD,"signal":signal,"signal_reasons":reasons,"regime":regime,"agreement":e["agreement"],"models":{"logistic":e["p_logistic"],"boosted_tree":e["p_tree"],"markov":e["p_markov"],"markov_order":e["markov_order"],"markov_support":e["markov_support"]},"calibration":{"available":iso is not None,"method":"isotonic" if iso is not None else "none","oos_samples":int(report.get("samples") or 0)},"feature_contributions":feature_contributions(m,x),"verified":0,"actual_size":None,"size_win":None}
-        public={k:v for k,v in report.items() if k not in {"calibrator","oos_labels","oos_probs"}}
-        MODEL_CACHE.update({"history_issue":rounds[-1]["issue"],"prediction":pred,"report":public,"ablation":ablation_report(rounds)})
+        m=fit_models(X,y)
+        f=build_features(live_rounds,target)
+        x=features_to_vector(f)
+        e=ensemble_probability(m,x,live_rounds)
+
+        iso=MODEL_CACHE.get("calibrator")
+        report_public=MODEL_CACHE.get("report")
+        ablation=MODEL_CACHE.get("ablation")
+
+        # Full walk-forward evaluation is deliberately periodic/background-only.
+        if full_eval:
+            report=walk_forward_report(rounds)
+            iso=report.get("calibrator")
+            report_public={k:v for k,v in report.items() if k not in {"calibrator","oos_labels","oos_probs"}}
+            ablation=ablation_report(rounds)
+            MODEL_CACHE["calibrator"]=iso
+            MODEL_CACHE["report"]=report_public
+            MODEL_CACHE["ablation"]=ablation
+
+        p_raw=e["p_big_raw"]
+        p_cal=apply_iso(iso,p_raw)
+        predicted="big" if p_cal>=.5 else "small"
+        conf=max(p_cal,1-p_cal)
+        regime=current_regime(live_rounds)
+        reasons=[]
+        signal="PREDICT"
+
+        oos_samples=int((report_public or {}).get("samples") or 0)
+        if conf<SIGNAL_THRESHOLD:
+            signal="SKIP";reasons.append("confidence_below_threshold")
+        if oos_samples<50:
+            signal="SKIP";reasons.append("insufficient_out_of_sample_support")
+        if regime=="HIGH_ENTROPY" and conf<max(.65,SIGNAL_THRESHOLD):
+            signal="SKIP";reasons.append("high_entropy_regime")
+        if e["agreement"]<2:
+            signal="SKIP";reasons.append("low_model_agreement")
+
+        pred={
+            "ready":True,
+            "issue":target,
+            "created_at":time.time(),
+            "model_version":MODEL_VERSION,
+            "predicted_size":predicted,
+            "p_big_raw":p_raw,
+            "p_big_calibrated":p_cal,
+            "confidence":conf,
+            "threshold":SIGNAL_THRESHOLD,
+            "signal":signal,
+            "signal_reasons":reasons,
+            "regime":regime,
+            "agreement":e["agreement"],
+            "models":{
+                "logistic":e["p_logistic"],
+                "boosted_tree":e["p_tree"],
+                "markov":e["p_markov"],
+                "markov_order":e["markov_order"],
+                "markov_support":e["markov_support"],
+            },
+            "calibration":{
+                "available":iso is not None,
+                "method":"isotonic" if iso is not None else "none",
+                "oos_samples":oos_samples,
+            },
+            "feature_contributions":feature_contributions(m,x),
+            "verified":0,
+            "actual_size":None,
+            "size_win":None,
+        }
+        MODEL_CACHE["history_issue"]=rounds[-1]["issue"]
+        MODEL_CACHE["prediction"]=pred
         return pred
 
-def latest_or_build(rounds):
-    if rounds and MODEL_CACHE.get("history_issue")==rounds[-1]["issue"] and MODEL_CACHE.get("prediction"):return MODEL_CACHE["prediction"]
-    return build_v9_prediction(rounds)
+
+def latest_saved_prediction_for(rounds):
+    if not rounds:
+        return {"ready":False,"reason":"no_history","model_version":MODEL_VERSION}
+
+    latest_issue=rounds[-1]["issue"]
+    if MODEL_CACHE.get("history_issue")==latest_issue and MODEL_CACHE.get("prediction"):
+        return MODEL_CACHE["prediction"]
+
+    expected=increment_issue(latest_issue)
+    saved=load_predictions(1)
+    if saved and str(saved[0].get("issue"))==str(expected):
+        p=saved[0]
+        p["ready"]=True
+        return p
+
+    return {
+        "ready":False,
+        "reason":"model_refresh_in_progress" if TRAIN_STATE.get("running") else "model_refresh_queued",
+        "issue":expected,
+        "model_version":MODEL_VERSION,
+    }
+
+
+def _recompute_worker(full_eval=False):
+    requested_full=bool(full_eval)
+    while True:
+        with TRAIN_LOCK:
+            TRAIN_STATE["running"]=True
+            TRAIN_STATE["pending"]=False
+            requested_full = requested_full or bool(TRAIN_STATE.get("pending_full"))
+            TRAIN_STATE["pending_full"]=False
+            TRAIN_STATE["last_started"]=time.time()
+            TRAIN_STATE["last_mode"]="full" if requested_full else "live"
+            TRAIN_STATE["last_error"]=None
+
+        try:
+            rounds=load_rounds(HISTORY_LIMIT)
+            if rounds:
+                # Every Nth round gets a full report; otherwise live refresh only.
+                do_full=requested_full or (len(rounds)%FULL_EVAL_EVERY==0)
+                pred=build_v9_prediction(rounds, full_eval=do_full)
+                if pred.get("ready"):
+                    save_prediction_local(pred)
+                    cloud_save_prediction(pred)
+        except Exception as exc:
+            with TRAIN_LOCK:
+                TRAIN_STATE["last_error"]=str(exc)
+        finally:
+            with TRAIN_LOCK:
+                TRAIN_STATE["last_finished"]=time.time()
+                pending=bool(TRAIN_STATE.get("pending"))
+                pending_full=bool(TRAIN_STATE.get("pending_full"))
+                if not pending:
+                    TRAIN_STATE["running"]=False
+                    return
+            requested_full=pending_full
+
+
+def schedule_recompute(full_eval=False):
+    with TRAIN_LOCK:
+        if TRAIN_STATE.get("running"):
+            TRAIN_STATE["pending"]=True
+            TRAIN_STATE["pending_full"]=bool(TRAIN_STATE.get("pending_full")) or bool(full_eval)
+            return False
+        TRAIN_STATE["running"]=True
+        TRAIN_STATE["pending"]=False
+        TRAIN_STATE["pending_full"]=False
+
+    t=threading.Thread(target=_recompute_worker,args=(bool(full_eval),),daemon=True,name="v9-model-refresh")
+    t.start()
+    return True
 
 def live_accuracy():
     p=[x for x in load_predictions(500) if int(x.get("verified") or 0)==1]; q=[x for x in p if x.get("signal")=="PREDICT"]
@@ -442,42 +590,140 @@ app.add_middleware(CORSMiddleware,allow_origins=CORS_LIST,allow_credentials=Fals
 @app.on_event("startup")
 def startup():
     init_db()
-    if round_count()==0:hydrate_from_firestore()
+    if round_count()==0:
+        hydrate_from_firestore()
+    # Never block app startup on ML/backtesting.
+    schedule_recompute(full_eval=True)
 
 @app.get("/")
-def root():return {"service":"online","version":APP_VERSION,"model_version":MODEL_VERSION,"purpose":"research/backtesting","target":"big_small"}
+def root():
+    return {
+        "service":"online",
+        "version":APP_VERSION,
+        "model_version":MODEL_VERSION,
+        "purpose":"research/backtesting",
+        "target":"big_small",
+        "model_refresh":dict(TRAIN_STATE),
+    }
+
 @app.get("/health")
-def health():return {"service":"online","version":APP_VERSION,"stored_rounds":round_count(),"history_limit":HISTORY_LIMIT,"minimum_train":MIN_TRAIN,"embargo":EMBARGO,"signal_threshold":SIGNAL_THRESHOLD,"firestore_enabled":bool(FIREBASE_PROJECT_ID and GOOGLE_APPLICATION_CREDENTIALS)}
+def health():
+    return {
+        "service":"online",
+        "version":APP_VERSION,
+        "stored_rounds":round_count(),
+        "history_limit":HISTORY_LIMIT,
+        "live_train_limit":LIVE_TRAIN_LIMIT,
+        "minimum_train":MIN_TRAIN,
+        "embargo":EMBARGO,
+        "signal_threshold":SIGNAL_THRESHOLD,
+        "full_eval_every":FULL_EVAL_EVERY,
+        "firestore_enabled":bool(FIREBASE_PROJECT_ID and GOOGLE_APPLICATION_CREDENTIALS),
+        "model_refresh":dict(TRAIN_STATE),
+    }
+
 @app.get("/api/memory")
 def memory():
-    p=psutil.Process(os.getpid());m=p.memory_info();return {"rss_mb":round(m.rss/1048576,2),"vms_mb":round(m.vms/1048576,2),"threads":p.num_threads(),"history_limit":HISTORY_LIMIT,"firestore_transport":"REST"}
+    p=psutil.Process(os.getpid());m=p.memory_info()
+    return {
+        "rss_mb":round(m.rss/1048576,2),
+        "vms_mb":round(m.vms/1048576,2),
+        "threads":p.num_threads(),
+        "history_limit":HISTORY_LIMIT,
+        "live_train_limit":LIVE_TRAIN_LIMIT,
+        "firestore_transport":"REST",
+        "model_refresh":dict(TRAIN_STATE),
+    }
+
 @app.get("/api/history")
 def history(limit:int=100):
     r=load_rounds(max(1,min(limit,500)));r.reverse();return {"rounds":r,"count":len(r)}
+
 @app.get("/api/predictions")
 def predictions(limit:int=100):
     r=load_predictions(max(1,min(limit,500)));return {"predictions":r,"count":len(r)}
+
 @app.get("/api/backtest")
-def backtest():
-    r=load_rounds(HISTORY_LIMIT);latest_or_build(r);return {"model_version":MODEL_VERSION,"walk_forward":MODEL_CACHE.get("report"),"ablation":MODEL_CACHE.get("ablation")}
+def backtest(refresh:bool=False):
+    if refresh:
+        schedule_recompute(full_eval=True)
+    return {
+        "model_version":MODEL_VERSION,
+        "walk_forward":MODEL_CACHE.get("report"),
+        "ablation":MODEL_CACHE.get("ablation"),
+        "model_refresh":dict(TRAIN_STATE),
+    }
+
 @app.get("/api/dashboard")
 def dashboard():
-    r=load_rounds(HISTORY_LIMIT);pred=latest_or_build(r) if r else {"ready":False,"reason":"no_history","model_version":MODEL_VERSION}
-    return {"version":APP_VERSION,"model_version":MODEL_VERSION,"latest_round":r[-1] if r else None,"prediction":pred,"accuracy":live_accuracy(),"walk_forward":MODEL_CACHE.get("report"),"ablation":MODEL_CACHE.get("ablation"),"recent_rounds":list(reversed(r[-30:])),"recent_predictions":load_predictions(30),"status":{"stored_rounds":len(r),"history_limit":HISTORY_LIMIT,"minimum_train":MIN_TRAIN,"signal_threshold":SIGNAL_THRESHOLD,"firestore_enabled":bool(FIREBASE_PROJECT_ID and GOOGLE_APPLICATION_CREDENTIALS)}}
+    # Dashboard must always be cheap and responsive. It never trains synchronously.
+    r=load_rounds(HISTORY_LIMIT)
+    pred=latest_saved_prediction_for(r)
+    if r and (MODEL_CACHE.get("history_issue") != r[-1]["issue"]):
+        schedule_recompute(full_eval=False)
+    return {
+        "version":APP_VERSION,
+        "model_version":MODEL_VERSION,
+        "latest_round":r[-1] if r else None,
+        "prediction":pred,
+        "accuracy":live_accuracy(),
+        "walk_forward":MODEL_CACHE.get("report"),
+        "ablation":MODEL_CACHE.get("ablation"),
+        "recent_rounds":list(reversed(r[-30:])),
+        "recent_predictions":load_predictions(30),
+        "model_refresh":dict(TRAIN_STATE),
+        "status":{
+            "stored_rounds":len(r),
+            "history_limit":HISTORY_LIMIT,
+            "live_train_limit":LIVE_TRAIN_LIMIT,
+            "minimum_train":MIN_TRAIN,
+            "signal_threshold":SIGNAL_THRESHOLD,
+            "firestore_enabled":bool(FIREBASE_PROJECT_ID and GOOGLE_APPLICATION_CREDENTIALS),
+        },
+    }
 
 @app.post("/api/ingest")
 def ingest(item:RoundInput):
-    if not INGEST_SECRET or item.secret!=INGEST_SECRET:return {"ok":False,"error":"Unauthorized"}
+    # Intentionally returns quickly. ML/backtesting is queued after persistence.
+    if not INGEST_SECRET or item.secret!=INGEST_SECRET:
+        return {"ok":False,"error":"Unauthorized"}
+
     issue=str(item.issue).strip();n=int(item.number);color=normalize_color(item.color)
     if not issue:return {"ok":False,"error":"Missing issue"}
     if not 0<=n<=9:return {"ok":False,"error":"Number must be 0..9"}
     if color not in {"red","green","violet"}:return {"ok":False,"error":"Invalid color"}
+
     rr=rp=0;re=None
-    if round_count()==0:rr,rp,re=hydrate_from_firestore()
-    inserted=save_round_local(issue,n,color); cre=cloud_save_round({"issue":issue,"number":n,"color":color,"seen_at":time.time()}) if inserted else None
-    ver=verify_prediction(issue,size_from_number(n)); cve=cloud_save_prediction(ver) if ver else None
-    pred=None;cpe=None
+    if round_count()==0:
+        rr,rp,re=hydrate_from_firestore()
+
+    inserted=save_round_local(issue,n,color)
+    cre=cloud_save_round({"issue":issue,"number":n,"color":color,"seen_at":time.time()}) if inserted else None
+
+    ver=verify_prediction(issue,size_from_number(n))
+    cve=cloud_save_prediction(ver) if ver else None
+
+    queued=False
     if inserted:
-        rounds=load_rounds(HISTORY_LIMIT);pred=build_v9_prediction(rounds)
-        if pred.get("ready"):save_prediction_local(pred);cpe=cloud_save_prediction(pred)
-    return {"ok":True,"inserted":inserted,"issue":issue,"stored_rounds":round_count(),"restored_rounds":rr,"restored_predictions":rp,"restore_error":re,"verified_prediction":ver,"prediction":pred,"cloud_errors":{"round":cre,"verified_prediction":cve,"prediction":cpe}}
+        queued=schedule_recompute(full_eval=False)
+
+    current_rounds=load_rounds(2)
+    current_prediction=latest_saved_prediction_for(current_rounds) if current_rounds else None
+
+    return {
+        "ok":True,
+        "inserted":inserted,
+        "issue":issue,
+        "stored_rounds":round_count(),
+        "restored_rounds":rr,
+        "restored_predictions":rp,
+        "restore_error":re,
+        "verified_prediction":ver,
+        "prediction":current_prediction,
+        "model_refresh_queued":queued or bool(TRAIN_STATE.get("running")),
+        "cloud_errors":{
+            "round":cre,
+            "verified_prediction":cve,
+        },
+    }
+

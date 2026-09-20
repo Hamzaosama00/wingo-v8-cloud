@@ -609,12 +609,6 @@ class PredictorEngine:
         context, context_support = self.context_distribution(games, feature, states)
 
         weights = self.regime_weights(
-            volatility=vol,
-            markov_support=markov_support,
-            pattern_support=pattern_support,
-            pattern_order=pattern_order,
-
-weights = self.regime_weights(
     volatility=vol,
     markov_support=markov_support,
     pattern_support=pattern_support,
@@ -622,4 +616,3 @@ weights = self.regime_weights(
     context_support=context_support,
     include_context=True,
 )
-       

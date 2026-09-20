@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>V9.3 Virtual PKR Simulator</title>
+<title>V9.4 Virtual PKR Simulator</title>
 <style>
 body{font-family:system-ui;background:#07111f;color:#fff;margin:0;padding:24px}
 main{max-width:900px;margin:auto}
@@ -17,14 +17,14 @@ pre{white-space:pre-wrap;overflow:auto}
 </style>
 </head>
 <body><main>
-<h1>V9.3 Virtual PKR Simulator</h1>
+<h1>V9.4 Virtual PKR Simulator</h1>
 <p>Historical simulation only — no live wallet or bet placement.</p>
 <div class="card grid">
 <div><label>Backend URL</label><input id="backend" value="https://wingo-v8-cloud.onrender.com"></div>
 <div><label>Starting Balance (PKR)</label><input id="start" type="number" min="1" value="1000"></div>
 <div><label>Target Balance (PKR)</label><input id="target" type="number" min="1" value="1500"></div>
 <div><label>Virtual Stake %</label><input id="stake" type="number" min="0.1" max="5" step="0.1" value="2"></div>
-<div><label>Max Historical Rounds</label><input id="rounds" type="number" min="1" max="1000" value="200"></div>
+<div><label>Max Historical Rounds</label><input id="rounds" type="number" min="10" max="1000" value="200"></div>
 </div>
 <button id="run">Run Simulation</button>
 <div class="card grid" id="summary">
@@ -46,7 +46,7 @@ $("run").addEventListener("click",async()=>{
   });
   $("out").textContent="Running...";
   try{
-    const r=await fetch(b+"/api/v9.3/simulate?"+qs.toString());
+    const r=await fetch(b+"/api/v9.4/simulate?"+qs.toString());
     const d=await r.json();
     $("end").textContent=d.ending_balance_pkr!=null?"₨ "+d.ending_balance_pkr:"—";
     $("peak").textContent=d.max_balance_reached_pkr!=null?"₨ "+d.max_balance_reached_pkr:"—";

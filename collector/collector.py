@@ -1,96 +1,64 @@
-import os
-import time
+import os, time
 import requests
 
-SOURCE_API = os.getenv(
-    "SOURCE_API",
-    "https://draw.ar-lottery01.com/WinGo/WinGo_30S/GetHistoryIssuePage.json",
-)
-BACKEND_URL = os.environ["BACKEND_URL"].rstrip("/")
-INGEST_SECRET = os.environ["INGEST_SECRET"]
-POLL = float(os.getenv("COLLECTOR_POLL_SECONDS", "3"))
-BACKFILL_SIZE = max(5, min(int(os.getenv("COLLECTOR_BACKFILL_SIZE", "20")), 100))
+SOURCE_API=os.getenv('SOURCE_API','https://draw.ar-lottery01.com/WinGo/WinGo_30S/GetHistoryIssuePage.json')
+BACKEND_URL=os.getenv('BACKEND_URL','').rstrip('/')
+INGEST_SECRET=os.getenv('INGEST_SECRET','')
+POLL_SECONDS=max(2.0,float(os.getenv('COLLECTOR_POLL_SECONDS','3')))
+BACKFILL_WINDOW=max(5,min(100,int(os.getenv('COLLECTOR_BACKFILL_WINDOW','20'))))
+HEADERS={'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36','Accept':'application/json','Origin':'https://www.92pak8.com','Referer':'https://www.92pak8.com/','Cache-Control':'no-cache'}
+s=requests.Session(); delivered=set()
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0",
-    "Accept": "application/json, text/plain, */*",
-    "Origin": os.getenv("WINGO_ORIGIN", "https://www.92pak8.com"),
-    "Referer": os.getenv("WINGO_REFERER", "https://www.92pak8.com/"),
-}
+def color(v):
+    c=(v or '').lower()
+    if 'violet' in c:return 'violet'
+    if 'red' in c:return 'red'
+    if 'green' in c:return 'green'
+    return ''
 
-session = requests.Session()
-session.headers.update(HEADERS)
-delivered = set()
+def fetch_recent():
+    r=s.get(SOURCE_API,params={'ts':int(time.time()*1000)},headers=HEADERS,timeout=15);r.raise_for_status();items=r.json().get('data',{}).get('list',[])
+    out=[]
+    for x in items[:BACKFILL_WINDOW]:
+        issue=str(x.get('issueNumber') or '')
+        try:n=int(x.get('number'))
+        except Exception:continue
+        c=color(str(x.get('color') or ''))
+        if issue and 0<=n<=9 and c:out.append({'issue':issue,'number':n,'color':c})
+    out.sort(key=lambda x:int(x['issue']));return out
 
-def issue_key(x):
-    s = str(x.get("issueNumber", ""))
-    try:
-        return (0, int(s))
-    except Exception:
-        return (1, s)
-
-def send_round(item):
-    issue = str(item["issueNumber"])
-    payload = {
-        "issue": issue,
-        "number": int(item["number"]),
-        "color": str(item.get("color", "")),
-        "secret": INGEST_SECRET,
-    }
-    # Retry transient backend failures with increasing delay.
-    last_exc = None
-    for attempt in range(5):
+def send(row):
+    payload={**row,'secret':INGEST_SECRET}
+    for attempt in range(1,6):
         try:
-            r = requests.post(BACKEND_URL + "/api/ingest", json=payload, timeout=30)
-            r.raise_for_status()
-            body = r.json()
-            if not body.get("ok"):
-                raise RuntimeError(body.get("error", "ingest rejected"))
-            print(
-                "[OK]", issue,
-                "stored=", body.get("stored_rounds"),
-                "restored=", body.get("restored_from_firestore", 0),
-            )
-            delivered.add(issue)
-            return True
-        except Exception as exc:
-            last_exc = exc
-            time.sleep(min(5 * (attempt + 1), 20))
-    print("[INGEST ERROR]", issue, type(last_exc).__name__, last_exc)
+            r=s.post(f'{BACKEND_URL}/api/ingest',json=payload,timeout=45)
+            try:b=r.json()
+            except Exception:b={}
+            if r.ok and b.get('ok') is True:
+                print(f"[OK] {row['issue']} {row['number']} {row['color']} stored={b.get('stored_rounds')}");return True
+            print(f"[POST] attempt={attempt} http={r.status_code} body={b or r.text[:180]}")
+            if b.get('error')=='Unauthorized':
+                print('[FATAL] INGEST_SECRET does not match backend.');return False
+        except Exception as e:print(f'[POST] attempt={attempt} error={e}')
+        time.sleep(min(10,attempt*2))
     return False
 
-print("WinGo V8.3.1 stable collector:", BACKEND_URL)
-print("Backfill window:", BACKFILL_SIZE)
+def main():
+    if not BACKEND_URL:raise SystemExit('BACKEND_URL is required')
+    if not INGEST_SECRET:raise SystemExit('INGEST_SECRET is required')
+    print('WinGo V9 collector online');print(f'Backend: {BACKEND_URL}');print(f'Poll: {POLL_SECONDS}s | Backfill: {BACKFILL_WINDOW}')
+    while True:
+        try:
+            rows=fetch_recent()
+            if rows:print(f"[GET] newest={rows[-1]['issue']} rows={len(rows)}")
+            for row in rows:
+                if row['issue'] in delivered:continue
+                if send(row):
+                    delivered.add(row['issue'])
+                    if len(delivered)>500:
+                        keep=sorted(delivered,key=int)[-300:];delivered.clear();delivered.update(keep)
+                else:break
+        except Exception as e:print(f'[GET] error={e}')
+        time.sleep(POLL_SECONDS)
 
-while True:
-    try:
-        r = session.get(
-            SOURCE_API,
-            params={
-                "pageNo": 1,
-                "pageSize": BACKFILL_SIZE,
-                "ts": int(time.time() * 1000),
-            },
-            timeout=15,
-        )
-        r.raise_for_status()
-        items = r.json().get("data", {}).get("list", [])
-
-        # API normally returns newest first. Oldest->newest means an outage can
-        # recover every still-visible completed round, not just the newest one.
-        for item in sorted(items, key=issue_key):
-            issue = str(item.get("issueNumber", ""))
-            if not issue or issue in delivered:
-                continue
-            if not send_round(item):
-                # Preserve order: retry this missing round on the next poll.
-                break
-
-        # Bound memory; Firestore/backend deduplication remains authoritative.
-        if len(delivered) > 500:
-            delivered = set(sorted(delivered)[-250:])
-
-    except Exception as exc:
-        print("[SOURCE ERROR]", type(exc).__name__, exc)
-
-    time.sleep(POLL)
+if __name__=='__main__':main()

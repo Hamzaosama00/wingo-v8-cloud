@@ -8,6 +8,8 @@ from contextlib import asynccontextmanager
 from typing import Any, Dict, Hashable, List, Optional, Sequence, Tuple
 
 import requests
+import firebase_admin
+from firebase_admin import credentials, firestore
 import numpy as np
 from sklearn.isotonic import IsotonicRegression
 from sklearn.linear_model import LogisticRegression
@@ -47,6 +49,20 @@ HEADERS = {
     "Origin": ORIGIN_HEADER,
     "Referer": REFERER_HEADER,
 }
+
+
+
+FIREBASE_PROJECT_ID = os.getenv("FIREBASE_PROJECT_ID", "").strip()
+FIREBASE_CREDENTIALS = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
+
+def get_firestore():
+    if not firebase_admin._apps:
+        opts = {"projectId": FIREBASE_PROJECT_ID} if FIREBASE_PROJECT_ID else None
+        if FIREBASE_CREDENTIALS:
+            firebase_admin.initialize_app(credentials.Certificate(FIREBASE_CREDENTIALS), opts)
+        else:
+            firebase_admin.initialize_app(options=opts)
+    return firestore.client()
 
 
 class PredictorEngine:
@@ -167,6 +183,37 @@ class PredictorEngine:
         with self._connect() as conn:
             row = conn.execute("SELECT COUNT(*) AS c FROM rounds").fetchone()
             return int(row["c"])
+
+    def persist_round_firestore(self, game: Dict[str, Any]) -> None:
+        payload = dict(game)
+        payload["issue"] = str(game["issue"])
+        payload["issue_num"] = int(game["issue"]) if str(game["issue"]).isdigit() else 0
+        payload["seen_at"] = int(time.time())
+        get_firestore().collection("rounds").document(str(game["issue"])).set(payload, merge=True)
+
+    def hydrate_rounds_firestore(self, limit: int = HISTORY_LIMIT) -> int:
+        """Restore Render's ephemeral SQLite cache from permanent Firestore."""
+        db = get_firestore()
+        docs = list(db.collection("rounds").order_by(
+            "issue_num", direction=firestore.Query.DESCENDING
+        ).limit(limit).stream())
+        restored = 0
+        for doc in reversed(docs):
+            d = doc.to_dict() or {}
+            try:
+                n = int(d["number"])
+                game = {
+                    "issue": str(d.get("issue") or doc.id),
+                    "number": n,
+                    "color": str(d.get("color", "")),
+                    "size": str(d.get("size") or ("big" if n >= 5 else "small")),
+                    "parity": str(d.get("parity") or ("even" if n % 2 == 0 else "odd")),
+                }
+                if self.save_round(game):
+                    restored += 1
+            except Exception:
+                continue
+        return restored
 
     def load_history(self, limit: int = HISTORY_LIMIT) -> List[Dict[str, Any]]:
         with self._connect() as conn:
@@ -1653,9 +1700,60 @@ def ingest_round(round_data: RoundInput):
         "parity": "even" if number % 2 == 0 else "odd",
     }
 
+    restored_from_firestore = 0
+
+
+    firebase_error = None
+
+
+    try:
+
+
+        # New Render deploys start with an empty ephemeral disk.
+
+
+        # Rebuild the cache BEFORE inserting/predicting.
+
+
+        if engine.count_rounds() == 0:
+
+
+            restored_from_firestore = engine.hydrate_rounds_firestore(HISTORY_LIMIT)
+
+
+    except Exception as exc:
+
+
+        firebase_error = f"hydrate: {type(exc).__name__}: {exc}"
+
+
+
     inserted = engine.save_round(game)
+
+
+
+    try:
+
+
+        # Firestore is the permanent source of truth across deployments.
+
+
+        engine.persist_round_firestore(game)
+
+
+    except Exception as exc:
+
+
+        firebase_error = f"persist: {type(exc).__name__}: {exc}"
+
+
+
     engine.verify_pending_predictions()
+
+
     history = engine.load_history(HISTORY_LIMIT)
+
+
     prediction = engine.save_next_prediction(history) if inserted else None
 
     return {
@@ -1664,4 +1762,7 @@ def ingest_round(round_data: RoundInput):
         "round": game,
         "stored_rounds": engine.count_rounds(),
         "prediction": prediction,
+        "restored_from_firestore": restored_from_firestore,
+        "firebase_error": firebase_error,
+        "storage": "firestore-persistent/sqlite-cache",
     }

@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>WinGo V9.3 Flash + PKR Simulator</title>
+<title>WinGo V9.4 Flash + PKR Simulator</title>
 <style>
 :root{
   --bg:#05070b;--s:#0b0f16;--s2:#111722;--s3:#151d2a;--b:#202938;
@@ -57,7 +57,7 @@ button:disabled{opacity:.55;cursor:not-allowed}
 <div class="w">
   <div class="top">
     <div>
-      <h1>WINGO V9.3 FLASH</h1>
+      <h1>WINGO V9.4 FLASH</h1>
       <div class="muted">Strict Big/Small research engine · walk-forward calibration · PKR virtual simulator</div>
     </div>
     <div class="badge" id="status">CONNECTING</div>
@@ -76,7 +76,7 @@ button:disabled{opacity:.55;cursor:not-allowed}
     <div class="card">
       <div class="label">Next round research output</div>
       <div class="signal skip" id="pred">WAIT</div>
-      <div class="sub" id="issue">V9.3 Flash</div>
+      <div class="sub" id="issue">V9.4 Flash</div>
 
       <div style="margin-top:16px">
         <div class="label">Calibrated confidence</div>
@@ -208,7 +208,7 @@ function model(name,p){
 }
 
 function renderFlash(p, dashboard){
-  $('status').textContent='V9.3 · ONLINE';
+  $('status').textContent='V9.4 · ONLINE';
   $('status').className='badge';
 
   const st=(dashboard&&dashboard.status)||{};
@@ -232,7 +232,7 @@ function renderFlash(p, dashboard){
   const pred=String(p.prediction||'—').toUpperCase();
   $('pred').textContent=pred;
   $('pred').className='signal '+(p.prediction==='big'?'big':'small');
-  $('issue').textContent='V9.3 Flash · strict research signal';
+  $('issue').textContent='V9.4 Flash · strict research signal';
   $('conf').textContent=pct(p.calibrated_confidence);
   $('confbar').style.width=`${Math.max(0,Math.min(1,Number(p.calibrated_confidence||0)))*100}%`;
 
@@ -271,7 +271,7 @@ function renderRecent(d){
 async function refresh(){
   try{
     const [flashRes,dashRes]=await Promise.allSettled([
-      fetch(`${API}/api/v9.3/flash`,{cache:'no-store'}),
+      fetch(`${API}/api/v9.4/flash`,{cache:'no-store'}),
       fetch(`${API}/api/dashboard`,{cache:'no-store'})
     ]);
 
@@ -279,7 +279,7 @@ async function refresh(){
     if(flashRes.status==='fulfilled' && flashRes.value.ok) flash=await flashRes.value.json();
     if(dashRes.status==='fulfilled' && dashRes.value.ok) dash=await dashRes.value.json();
 
-    if(!flash) throw Error('V9.3 endpoint unavailable');
+    if(!flash) throw Error('V9.4 endpoint unavailable');
     renderFlash(flash,dash);
     if(dash) renderRecent(dash);
   }catch(e){
@@ -299,7 +299,7 @@ async function runSimulation(){
   if(!Number.isFinite(start)||start<=0){$('simStatus').textContent='INVALID START BALANCE';return}
   if(!Number.isFinite(target)||target<start){$('simStatus').textContent='TARGET MUST BE ≥ START';return}
   if(!Number.isFinite(stake)||stake<0.1||stake>5){$('simStatus').textContent='STAKE MUST BE 0.1–5%';return}
-  if(!Number.isFinite(rounds)||rounds<1||rounds>1000){$('simStatus').textContent='ROUNDS MUST BE 1–1000';return}
+  if(!Number.isFinite(rounds)||rounds<10||rounds>1000){$('simStatus').textContent='ROUNDS MUST BE 10–1000';return}
 
   btn.disabled=true;
   $('simStatus').textContent='SIMULATING…';
@@ -311,7 +311,7 @@ async function runSimulation(){
       stake_percent:String(stake),
       max_rounds:String(Math.floor(rounds))
     });
-    const r=await fetch(`${API}/api/v9.3/simulate?${qs.toString()}`,{cache:'no-store'});
+    const r=await fetch(`${API}/api/v9.4/simulate?${qs.toString()}`,{cache:'no-store'});
     if(!r.ok) throw Error(`HTTP ${r.status}`);
     const d=await r.json();
 

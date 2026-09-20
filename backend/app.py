@@ -8,6 +8,7 @@ from contextlib import asynccontextmanager
 from typing import Any, Dict, Hashable, List, Optional, Sequence, Tuple
 
 import requests
+import psutil
 import firebase_admin
 from firebase_admin import credentials, firestore
 from fastapi import FastAPI
@@ -24,12 +25,13 @@ ORIGIN_HEADER = os.getenv("WINGO_ORIGIN", "https://www.92pak8.com")
 REFERER_HEADER = os.getenv("WINGO_REFERER", "https://www.92pak8.com/")
 DB_PATH = os.getenv("DB_PATH", "wingo_master.db")
 
-HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "500"))
-BACKFILL_TARGET = int(os.getenv("BACKFILL_TARGET", "500"))
+HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "300"))
+BACKFILL_TARGET = int(os.getenv("BACKFILL_TARGET", "300"))
 BACKFILL_PAGE_SIZE = int(os.getenv("BACKFILL_PAGE_SIZE", "100"))
 POLL_SECONDS = float(os.getenv("POLL_SECONDS", "3"))
 MIN_HISTORY = int(os.getenv("MIN_HISTORY", "50"))
 NUMBER_STATES = list(range(10))
+ENABLE_SOURCE_WORKER = os.getenv("ENABLE_SOURCE_WORKER", "0").lower() in ("1", "true", "yes")
 
 COLOR_STATES = ["red", "green", "violet"]
 SIZE_STATES = ["small", "big"]
@@ -192,24 +194,23 @@ class PredictorEngine:
         get_firestore().collection("rounds").document(str(game["issue"])).set(payload, merge=True)
 
     def hydrate_from_firestore(self, limit: int = HISTORY_LIMIT) -> int:
-        """Rebuild ephemeral SQLite from permanent Firestore history."""
-        docs = list(
+        """Rebuild ephemeral SQLite from permanent Firestore without buffering docs."""
+        restored = 0
+        query = (
             get_firestore().collection("rounds")
             .order_by("issue", direction=firestore.Query.DESCENDING)
             .limit(limit)
-            .stream()
         )
-        restored = 0
-        # Save oldest -> newest so local state is naturally ordered.
-        for doc in reversed(docs):
+        for doc in query.stream():
             data = doc.to_dict() or {}
             try:
+                number = int(data["number"])
                 game = {
                     "issue": str(data.get("issue") or doc.id),
-                    "number": int(data["number"]),
+                    "number": number,
                     "color": str(data["color"]),
-                    "size": str(data.get("size") or ("big" if int(data["number"]) >= 5 else "small")),
-                    "parity": str(data.get("parity") or ("even" if int(data["number"]) % 2 == 0 else "odd")),
+                    "size": str(data.get("size") or ("big" if number >= 5 else "small")),
+                    "parity": str(data.get("parity") or ("even" if number % 2 == 0 else "odd")),
                 }
                 if self.save_round(game):
                     restored += 1
@@ -222,6 +223,62 @@ class PredictorEngine:
             return
         payload = {k: v for k, v in prediction.items() if v is not None}
         get_firestore().collection("predictions").document(str(prediction["issue"])).set(payload, merge=True)
+
+    def hydrate_predictions_from_firestore(self, limit: int = 400) -> int:
+        """Restore prediction ledger so a restart cannot silently replace an old forecast."""
+        restored = 0
+        query = (
+            get_firestore().collection("predictions")
+            .order_by("created_at", direction=firestore.Query.DESCENDING)
+            .limit(limit)
+        )
+        with self._connect() as conn:
+            for doc in query.stream():
+                d = doc.to_dict() or {}
+                try:
+                    vals = (
+                        str(d.get("issue") or doc.id),
+                        str(d["based_on_issue"]),
+                        str(d["joint_state"]),
+                        str(d["predicted_color"]),
+                        str(d["predicted_size"]),
+                        str(d["predicted_parity"]),
+                        int(d["predicted_number"]) if d.get("predicted_number") is not None else None,
+                        float(d["joint_score"]), float(d["joint_margin"]), float(d["joint_entropy"]),
+                        int(d["joint_support"]), int(d["agreement_count"]), str(d["regime"]),
+                        float(d["volatility"]), str(d["signal"]), float(d["color_score"]),
+                        float(d["size_score"]), float(d["parity_score"]), int(d["created_at"]),
+                        int(d.get("verified") or 0),
+                        d.get("actual_number"), d.get("actual_color"), d.get("actual_size"), d.get("actual_parity"),
+                        d.get("joint_win"), d.get("color_win"), d.get("size_win"), d.get("parity_win"),
+                    )
+                    cur = conn.execute("""
+                        INSERT OR IGNORE INTO predictions (
+                            issue,based_on_issue,joint_state,predicted_color,predicted_size,predicted_parity,
+                            predicted_number,joint_score,joint_margin,joint_entropy,joint_support,agreement_count,
+                            regime,volatility,signal,color_score,size_score,parity_score,created_at,verified,
+                            actual_number,actual_color,actual_size,actual_parity,joint_win,color_win,size_win,parity_win
+                        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """, vals)
+                    restored += int(cur.rowcount > 0)
+                except Exception:
+                    continue
+            conn.commit()
+        return restored
+
+    def sync_verified_predictions_to_cloud(self, limit: int = 50) -> None:
+        """Persist verification results too, so accuracy survives Render restarts."""
+        with self._connect() as conn:
+            rows = conn.execute("""
+                SELECT * FROM predictions
+                WHERE verified = 1
+                ORDER BY created_at DESC
+                LIMIT ?
+            """, (limit,)).fetchall()
+        db = get_firestore()
+        for row in rows:
+            payload = {k: v for k, v in dict(row).items() if v is not None}
+            db.collection("predictions").document(str(row["issue"])).set(payload, merge=True)
 
     def load_history(self, limit: int = HISTORY_LIMIT) -> List[Dict[str, Any]]:
         with self._connect() as conn:
@@ -1412,6 +1469,7 @@ class PredictorEngine:
             "stored_rounds": self.count_rounds(),
             "history_limit": HISTORY_LIMIT,
             "minimum_history": MIN_HISTORY,
+            "source_worker_enabled": ENABLE_SOURCE_WORKER,
             "last_poll_at": self.last_poll_at,
             "last_api_ok_at": self.last_api_ok_at,
             "last_error": self.last_error,
@@ -1423,14 +1481,16 @@ engine = PredictorEngine()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    engine.start_worker()
+    if ENABLE_SOURCE_WORKER:
+        engine.start_worker()
     yield
-    engine.stop_worker()
+    if ENABLE_SOURCE_WORKER:
+        engine.stop_worker()
 
 
 app = FastAPI(
     title="WinGo Statistical Predictor API",
-    version="8.3.0",
+    version="8.3.1",
     lifespan=lifespan,
 )
 
@@ -1458,9 +1518,22 @@ app.add_middleware(
 def root():
     return {
         "name": "WinGo Statistical Predictor API",
-        "version": "8.1.0",
+        "version": "8.3.1",
         "status": "online",
         "docs": "/docs",
+    }
+
+
+@app.get("/api/memory")
+def memory_status():
+    proc = psutil.Process(os.getpid())
+    m = proc.memory_info()
+    return {
+        "rss_mb": round(m.rss / 1024 / 1024, 1),
+        "vms_mb": round(m.vms / 1024 / 1024, 1),
+        "threads": proc.num_threads(),
+        "history_limit": HISTORY_LIMIT,
+        "source_worker_enabled": ENABLE_SOURCE_WORKER,
     }
 
 
@@ -1526,7 +1599,7 @@ def compare_predictions(limit: int = 50):
         items.append(x)
 
     return {
-        "model_version": "8.3",
+        "model_version": "8.3.1",
         "verified": verified,
         "joint_wins": wins,
         "joint_accuracy": round((wins / verified * 100), 2) if verified else None,
@@ -1570,12 +1643,13 @@ def ingest_round(round_data: RoundInput):
 
     firebase_error = None
     restored = 0
+    restored_predictions = 0
 
-    # Firestore is permanent storage. Render's local SQLite is only a fast cache.
+    # Firestore is authoritative; SQLite is disposable cache only.
     try:
-        # A fresh/restarted Render instance has an empty ephemeral DB.
         if engine.count_rounds() == 0:
             restored = engine.hydrate_from_firestore(HISTORY_LIMIT)
+            restored_predictions = engine.hydrate_predictions_from_firestore()
     except Exception as exc:
         firebase_error = f"hydrate: {type(exc).__name__}: {exc}"
 
@@ -1587,7 +1661,12 @@ def ingest_round(round_data: RoundInput):
     except Exception as exc:
         firebase_error = f"round-write: {type(exc).__name__}: {exc}"
 
-    engine.verify_pending_predictions()
+    verified_now = engine.verify_pending_predictions()
+    if verified_now:
+        try:
+            engine.sync_verified_predictions_to_cloud()
+        except Exception as exc:
+            firebase_error = f"verify-sync: {type(exc).__name__}: {exc}"
     history = engine.load_history(HISTORY_LIMIT)
     prediction = engine.save_next_prediction(history) if inserted else None
 
@@ -1602,8 +1681,9 @@ def ingest_round(round_data: RoundInput):
         "round": game,
         "stored_rounds": engine.count_rounds(),
         "restored_from_firestore": restored,
+        "restored_predictions": restored_predictions,
         "prediction": prediction,
         "firebase_error": firebase_error,
         "storage": "firestore-primary/sqlite-cache",
-        "model_version": "8.3",
+        "model_version": "8.3.1",
     }

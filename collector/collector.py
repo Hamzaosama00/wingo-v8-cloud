@@ -59,7 +59,7 @@ def send_round(item):
     print("[INGEST ERROR]", issue, type(last_exc).__name__, last_exc)
     return False
 
-print("WinGo V8.1 collector:", BACKEND_URL)
+print("WinGo V8.3.1 stable collector:", BACKEND_URL)
 print("Backfill window:", BACKFILL_SIZE)
 
 while True:

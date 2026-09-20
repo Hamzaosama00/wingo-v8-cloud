@@ -1,0 +1,1407 @@
+import math
+import os
+import sqlite3
+import threading
+import time
+from collections import defaultdict
+from contextlib import asynccontextmanager
+from typing import Any, Dict, Hashable, List, Optional, Sequence, Tuple
+
+import requests
+import firebase_admin
+from firebase_admin import credentials, firestore
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+
+HISTORY_URL = os.getenv(
+    "WINGO_HISTORY_URL",
+    "https://draw.ar-lottery01.com/WinGo/WinGo_30S/GetHistoryIssuePage.json",
+)
+
+ORIGIN_HEADER = os.getenv("WINGO_ORIGIN", "https://www.92pak8.com")
+REFERER_HEADER = os.getenv("WINGO_REFERER", "https://www.92pak8.com/")
+DB_PATH = os.getenv("DB_PATH", "wingo_master.db")
+
+HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "500"))
+BACKFILL_TARGET = int(os.getenv("BACKFILL_TARGET", "500"))
+BACKFILL_PAGE_SIZE = int(os.getenv("BACKFILL_PAGE_SIZE", "100"))
+POLL_SECONDS = float(os.getenv("POLL_SECONDS", "3"))
+MIN_HISTORY = int(os.getenv("MIN_HISTORY", "50"))
+NUMBER_STATES = list(range(10))
+
+COLOR_STATES = ["red", "green", "violet"]
+SIZE_STATES = ["small", "big"]
+PARITY_STATES = ["even", "odd"]
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/153.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
+    "Origin": ORIGIN_HEADER,
+    "Referer": REFERER_HEADER,
+}
+
+FIREBASE_PROJECT_ID = os.getenv("FIREBASE_PROJECT_ID", "").strip()
+FIREBASE_CREDENTIALS = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
+
+def get_firestore():
+    if not firebase_admin._apps:
+        if FIREBASE_CREDENTIALS:
+            firebase_admin.initialize_app(credentials.Certificate(FIREBASE_CREDENTIALS), {"projectId": FIREBASE_PROJECT_ID} if FIREBASE_PROJECT_ID else None)
+        else:
+            firebase_admin.initialize_app(options={"projectId": FIREBASE_PROJECT_ID} if FIREBASE_PROJECT_ID else None)
+    return firestore.client()
+
+
+
+class PredictorEngine:
+    def __init__(self) -> None:
+        self.session = requests.Session()
+        self.session.headers.update(HEADERS)
+        self.stop_event = threading.Event()
+        self.worker: Optional[threading.Thread] = None
+        self.lock = threading.RLock()
+
+        self.last_error: Optional[str] = None
+        self.last_poll_at: Optional[int] = None
+        self.last_api_ok_at: Optional[int] = None
+        self.last_seen_issue: Optional[str] = None
+
+        self.ema_decay = float(os.getenv("EMA_DECAY", "0.82"))
+        self._setup_db()
+
+    # ---------------------------------------------------------
+    # Database helpers
+    # ---------------------------------------------------------
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(DB_PATH, timeout=30)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _setup_db(self) -> None:
+        db_parent = os.path.dirname(os.path.abspath(DB_PATH))
+        os.makedirs(db_parent, exist_ok=True)
+
+        with self._connect() as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS rounds (
+                    issue TEXT PRIMARY KEY,
+                    number INTEGER NOT NULL,
+                    color TEXT NOT NULL,
+                    size TEXT NOT NULL,
+                    parity TEXT NOT NULL,
+                    seen_at INTEGER NOT NULL
+                )
+            """)
+
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS predictions (
+                    issue TEXT PRIMARY KEY,
+                    based_on_issue TEXT NOT NULL,
+
+                    joint_state TEXT NOT NULL,
+                    predicted_color TEXT NOT NULL,
+                    predicted_size TEXT NOT NULL,
+                    predicted_parity TEXT NOT NULL,
+
+                    joint_score REAL NOT NULL,
+                    joint_margin REAL NOT NULL,
+                    joint_entropy REAL NOT NULL,
+                    joint_support INTEGER NOT NULL,
+                    agreement_count INTEGER NOT NULL,
+                    regime TEXT NOT NULL,
+                    volatility REAL NOT NULL,
+                    signal TEXT NOT NULL,
+
+                    color_score REAL NOT NULL,
+                    size_score REAL NOT NULL,
+                    parity_score REAL NOT NULL,
+
+                    created_at INTEGER NOT NULL,
+                    verified INTEGER NOT NULL DEFAULT 0,
+
+                    actual_color TEXT,
+                    actual_size TEXT,
+                    actual_parity TEXT,
+                    joint_win INTEGER,
+                    color_win INTEGER,
+                    size_win INTEGER,
+                    parity_win INTEGER
+                )
+            """)
+
+            # V7 migration: keep the predicted digit as well as derived features.
+            columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(predictions)").fetchall()
+            }
+            if "predicted_number" not in columns:
+                conn.execute("ALTER TABLE predictions ADD COLUMN predicted_number INTEGER")
+
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_rounds_seen_at
+                ON rounds(seen_at)
+            """)
+
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_predictions_created
+                ON predictions(created_at)
+            """)
+
+            conn.commit()
+
+    def save_round(self, game: Dict[str, Any]) -> bool:
+        with self._connect() as conn:
+            cur = conn.execute("""
+                INSERT OR IGNORE INTO rounds
+                (issue, number, color, size, parity, seen_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (
+                game["issue"],
+                game["number"],
+                game["color"],
+                game["size"],
+                game["parity"],
+                int(time.time()),
+            ))
+            conn.commit()
+            return cur.rowcount > 0
+
+    def count_rounds(self) -> int:
+        with self._connect() as conn:
+            row = conn.execute("SELECT COUNT(*) AS c FROM rounds").fetchone()
+            return int(row["c"])
+
+    def load_history(self, limit: int = HISTORY_LIMIT) -> List[Dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute("""
+                SELECT issue, number, color, size, parity, seen_at
+                FROM rounds
+                ORDER BY
+                    CASE
+                        WHEN issue GLOB '[0-9]*' THEN CAST(issue AS INTEGER)
+                        ELSE seen_at
+                    END DESC
+                LIMIT ?
+            """, (limit,)).fetchall()
+
+        rows = list(reversed(rows))
+        return [dict(row) for row in rows]
+
+    def prediction_exists(self, issue: str) -> bool:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM predictions WHERE issue = ?",
+                (issue,),
+            ).fetchone()
+        return row is not None
+
+    # ---------------------------------------------------------
+    # API and parsing
+    # ---------------------------------------------------------
+
+    def fetch_history(self, page_no: int = 1, page_size: int = 100) -> Optional[Dict[str, Any]]:
+        try:
+            response = self.session.get(
+                HISTORY_URL,
+                params={
+                    "pageNo": page_no,
+                    "pageSize": page_size,
+                    "ts": int(time.time() * 1000),
+                },
+                timeout=10,
+            )
+            response.raise_for_status()
+            data = response.json()
+
+            self.last_api_ok_at = int(time.time())
+            self.last_error = None
+            return data
+
+        except Exception as exc:
+            self.last_error = f"{type(exc).__name__}: {exc}"
+            return None
+
+    @staticmethod
+    def parse_color(raw: Any) -> Optional[str]:
+        parts = [x.strip().lower() for x in str(raw).split(",") if x.strip()]
+
+        if "violet" in parts:
+            return "violet"
+        if "red" in parts:
+            return "red"
+        if "green" in parts:
+            return "green"
+        return None
+
+    def parse_api_history(self, data: Dict[str, Any]) -> List[Dict[str, Any]]:
+        try:
+            items = data["data"]["list"]
+        except (KeyError, TypeError):
+            return []
+
+        parsed: List[Dict[str, Any]] = []
+
+        for item in items:
+            try:
+                issue = str(item["issueNumber"])
+                number = int(item["number"])
+                color = self.parse_color(item.get("color", ""))
+
+                if color is None:
+                    continue
+
+                parsed.append({
+                    "issue": issue,
+                    "number": number,
+                    "color": color,
+                    "size": "big" if number >= 5 else "small",
+                    "parity": "even" if number % 2 == 0 else "odd",
+                })
+
+            except (KeyError, TypeError, ValueError):
+                continue
+
+        # API commonly returns newest -> oldest.
+        parsed.reverse()
+        return parsed
+
+    # ---------------------------------------------------------
+    # Generic statistical models
+    # ---------------------------------------------------------
+
+    @staticmethod
+    def normalize(scores: Dict[Hashable, float], states: Sequence[Hashable]) -> Dict[Hashable, float]:
+        total = sum(max(float(scores.get(state, 0.0)), 0.0) for state in states)
+
+        if total <= 0:
+            uniform = 1.0 / len(states)
+            return {state: uniform for state in states}
+
+        return {
+            state: max(float(scores.get(state, 0.0)), 0.0) / total
+            for state in states
+        }
+
+    def ema_distribution(
+        self,
+        sequence: Sequence[Hashable],
+        states: Sequence[Hashable],
+    ) -> Dict[Hashable, float]:
+        scores = {state: 1.0 for state in states}
+
+        if not sequence:
+            return self.normalize(scores, states)
+
+        newest_index = len(sequence) - 1
+
+        for index, value in enumerate(sequence):
+            if value not in scores:
+                continue
+
+            distance = newest_index - index
+            scores[value] += self.ema_decay ** distance
+
+        return self.normalize(scores, states)
+
+    def markov_distribution(
+        self,
+        sequence: Sequence[Hashable],
+        states: Sequence[Hashable],
+    ) -> Tuple[Dict[Hashable, float], int]:
+        scores = {state: 1.0 for state in states}
+
+        if len(sequence) < 2:
+            return self.normalize(scores, states), 0
+
+        current = sequence[-1]
+        support = 0
+
+        for i in range(len(sequence) - 1):
+            if sequence[i] != current:
+                continue
+
+            nxt = sequence[i + 1]
+            if nxt in scores:
+                scores[nxt] += 1.0
+                support += 1
+
+        return self.normalize(scores, states), support
+
+    def ngram_distribution(
+        self,
+        sequence: Sequence[Hashable],
+        states: Sequence[Hashable],
+        max_order: int = 5,
+    ) -> Tuple[Dict[Hashable, float], int, int]:
+        if len(sequence) < 4:
+            return self.normalize({s: 1.0 for s in states}, states), 0, 0
+
+        max_order = min(max_order, len(sequence) - 1)
+
+        for order in range(max_order, 0, -1):
+            context = tuple(sequence[-order:])
+            scores = {state: 1.0 for state in states}
+            support = 0
+
+            # The current trailing context itself is not allowed to have a future.
+            for i in range(0, len(sequence) - order):
+                historical_context = tuple(sequence[i:i + order])
+
+                if historical_context != context:
+                    continue
+
+                next_index = i + order
+                if next_index >= len(sequence):
+                    continue
+
+                nxt = sequence[next_index]
+                if nxt in scores:
+                    scores[nxt] += 1.0
+                    support += 1
+
+            if support >= 2:
+                return self.normalize(scores, states), support, order
+
+        return self.normalize({s: 1.0 for s in states}, states), 0, 0
+
+    def streak_distribution(
+        self,
+        sequence: Sequence[Hashable],
+        states: Sequence[Hashable],
+    ) -> Tuple[Dict[Hashable, float], int]:
+        scores = {state: 1.0 for state in states}
+
+        if not sequence:
+            return self.normalize(scores, states), 0
+
+        latest = sequence[-1]
+        streak = 1
+
+        for i in range(len(sequence) - 2, -1, -1):
+            if sequence[i] != latest:
+                break
+            streak += 1
+
+        if streak >= 4:
+            scores[latest] += 2.0
+        elif streak == 3:
+            scores[latest] += 1.25
+        elif streak == 2:
+            scores[latest] += 0.5
+
+        return self.normalize(scores, states), streak
+
+    @staticmethod
+    def normalized_entropy(distribution: Dict[Hashable, float]) -> float:
+        if len(distribution) <= 1:
+            return 0.0
+
+        entropy = 0.0
+
+        for probability in distribution.values():
+            p = float(probability)
+            if p > 0:
+                entropy -= p * math.log2(p)
+
+        maximum = math.log2(len(distribution))
+        return entropy / maximum if maximum > 0 else 0.0
+
+    @staticmethod
+    def gap_since_previous_same(sequence: Sequence[Hashable]) -> int:
+        if len(sequence) < 2:
+            return len(sequence)
+
+        target = sequence[-1]
+
+        for distance in range(1, len(sequence)):
+            if sequence[-1 - distance] == target:
+                return distance
+
+        return len(sequence)
+
+    @staticmethod
+    def volatility(sequence: Sequence[Hashable], window: int = 20) -> float:
+        seq = list(sequence[-window:])
+
+        if len(seq) < 2:
+            return 0.5
+
+        changes = sum(
+            1
+            for i in range(1, len(seq))
+            if seq[i] != seq[i - 1]
+        )
+
+        return changes / (len(seq) - 1)
+
+    # ---------------------------------------------------------
+    # Feature and joint state helpers
+    # ---------------------------------------------------------
+
+    @staticmethod
+    def joint_state(game: Dict[str, Any]) -> Tuple[str, str, str]:
+        return (
+            game["color"],
+            game["size"],
+            game["parity"],
+        )
+
+    @staticmethod
+    def joint_key(state: Tuple[str, str, str]) -> str:
+        return "|".join(state)
+
+    def combined_volatility(self, games: List[Dict[str, Any]], window: int = 20) -> float:
+        recent = games[-window:]
+
+        if len(recent) < 2:
+            return 0.5
+
+        values = []
+
+        for feature in ("color", "size", "parity"):
+            seq = [game[feature] for game in recent]
+            values.append(self.volatility(seq, window=len(seq)))
+
+        return sum(values) / len(values)
+
+    @staticmethod
+    def regime_from_volatility(volatility: float) -> str:
+        if volatility < 0.30:
+            return "stable"
+        if volatility > 0.70:
+            return "choppy"
+        return "normal"
+
+    def regime_weights(
+        self,
+        volatility: float,
+        markov_support: int,
+        pattern_support: int,
+        pattern_order: int,
+        context_support: int = 0,
+        include_context: bool = False,
+    ) -> Dict[str, float]:
+        regime = self.regime_from_volatility(volatility)
+
+        if regime == "stable":
+            raw = {
+                "ema": 0.10,
+                "markov": 0.45,
+                "pattern": 0.10,
+                "streak": 0.25,
+            }
+        elif regime == "choppy":
+            raw = {
+                "ema": 0.40,
+                "markov": 0.10,
+                "pattern": 0.30,
+                "streak": 0.05,
+            }
+        else:
+            raw = {
+                "ema": 0.25,
+                "markov": 0.25,
+                "pattern": 0.25,
+                "streak": 0.10,
+            }
+
+        # Evidence-sensitive adjustment. Weak models get less say.
+        markov_strength = min(markov_support / 20.0, 1.0)
+        pattern_strength = min(pattern_support / 10.0, 1.0)
+        order_strength = min(pattern_order / 5.0, 1.0) if pattern_order else 0.0
+
+        raw["markov"] *= 0.30 + 0.70 * markov_strength
+        raw["pattern"] *= 0.20 + 0.80 * pattern_strength * max(order_strength, 0.2)
+
+        if include_context:
+            context_strength = min(context_support / 15.0, 1.0)
+            raw["context"] = 0.15 * (0.25 + 0.75 * context_strength)
+
+        total = sum(raw.values())
+        return {name: value / total for name, value in raw.items()}
+
+    def context_distribution(
+        self,
+        games: List[Dict[str, Any]],
+        feature: str,
+        states: Sequence[Hashable],
+    ) -> Tuple[Dict[Hashable, float], int]:
+        scores = {state: 1.0 for state in states}
+
+        if len(games) < 2:
+            return self.normalize(scores, states), 0
+
+        current_context = self.joint_state(games[-1])
+        support = 0
+
+        for i in range(len(games) - 1):
+            if self.joint_state(games[i]) != current_context:
+                continue
+
+            nxt = games[i + 1][feature]
+            if nxt in scores:
+                scores[nxt] += 1.0
+                support += 1
+
+        return self.normalize(scores, states), support
+
+    # ---------------------------------------------------------
+    # Individual feature model
+    # ---------------------------------------------------------
+
+    def predict_feature(
+        self,
+        games: List[Dict[str, Any]],
+        feature: str,
+        states: Sequence[Hashable],
+    ) -> Dict[str, Any]:
+        sequence = [game[feature] for game in games]
+        vol = self.combined_volatility(games)
+
+        ema = self.ema_distribution(sequence, states)
+        markov, markov_support = self.markov_distribution(sequence, states)
+        pattern, pattern_support, pattern_order = self.ngram_distribution(sequence, states)
+        streak, streak_length = self.streak_distribution(sequence, states)
+        context, context_support = self.context_distribution(games, feature, states)
+
+        weights = self.regime_weights(
+            volatility=vol,
+            markov_support=markov_support,
+            pattern_support=pattern_support,
+            pattern_order=pattern_order,
+            context_support=context_support,
+            include_context=True,
+        )
+
+        scores: Dict[Hashable, float] = {}
+
+        for state in states:
+            scores[state] = (
+                ema[state] * weights["ema"]
+                + markov[state] * weights["markov"]
+                + pattern[state] * weights["pattern"]
+                + streak[state] * weights["streak"]
+                + context[state] * weights["context"]
+            )
+
+        scores = self.normalize(scores, states)
+        ordered = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+
+        prediction = ordered[0][0]
+        score = float(ordered[0][1])
+        margin = score - float(ordered[1][1])
+
+        return {
+            "prediction": prediction,
+            "score": score,
+            "margin": margin,
+            "entropy": self.normalized_entropy(scores),
+            "distribution": scores,
+            "weights": weights,
+            "markov_support": markov_support,
+            "pattern_support": pattern_support,
+            "pattern_order": pattern_order,
+            "context_support": context_support,
+            "streak_length": streak_length,
+            "gap_current": self.gap_since_previous_same(sequence),
+            "total_support": markov_support + pattern_support + context_support,
+        }
+
+    # ---------------------------------------------------------
+    # Joint-state model
+    # ---------------------------------------------------------
+
+    def predict_joint(self, games: List[Dict[str, Any]]) -> Dict[str, Any]:
+        sequence = [self.joint_state(game) for game in games]
+
+        # Learn valid joint states from observed history.
+        states = sorted(set(sequence))
+
+        if len(states) < 2:
+            states = list(set(states) | {
+                ("red", "small", "even"),
+                ("green", "small", "odd"),
+            })
+
+        vol = self.combined_volatility(games)
+
+        ema = self.ema_distribution(sequence, states)
+        markov, markov_support = self.markov_distribution(sequence, states)
+        pattern, pattern_support, pattern_order = self.ngram_distribution(sequence, states)
+        streak, streak_length = self.streak_distribution(sequence, states)
+
+        weights = self.regime_weights(
+            volatility=vol,
+            markov_support=markov_support,
+            pattern_support=pattern_support,
+            pattern_order=pattern_order,
+            include_context=False,
+        )
+
+        scores: Dict[Hashable, float] = {}
+
+        for state in states:
+            scores[state] = (
+                ema[state] * weights["ema"]
+                + markov[state] * weights["markov"]
+                + pattern[state] * weights["pattern"]
+                + streak[state] * weights["streak"]
+            )
+
+        scores = self.normalize(scores, states)
+        ordered = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+
+        prediction = ordered[0][0]
+        score = float(ordered[0][1])
+        second = float(ordered[1][1]) if len(ordered) > 1 else 0.0
+
+        return {
+            "prediction": prediction,
+            "score": score,
+            "margin": score - second,
+            "entropy": self.normalized_entropy(scores),
+            "distribution": scores,
+            "weights": weights,
+            "markov_support": markov_support,
+            "pattern_support": pattern_support,
+            "pattern_order": pattern_order,
+            "streak_length": streak_length,
+            "gap_current": self.gap_since_previous_same(sequence),
+            "total_support": markov_support + pattern_support,
+            "volatility": vol,
+            "regime": self.regime_from_volatility(vol),
+        }
+
+    # ---------------------------------------------------------
+    # V7 number-first adaptive model
+    # ---------------------------------------------------------
+
+    @staticmethod
+    def features_from_number(number: int) -> Tuple[str, str, str]:
+        # Matches the API parsing convention used by this project:
+        # violet takes precedence for 0/5; otherwise even=red, odd=green.
+        if number in (0, 5):
+            color = "violet"
+        else:
+            color = "red" if number % 2 == 0 else "green"
+        size = "big" if number >= 5 else "small"
+        parity = "even" if number % 2 == 0 else "odd"
+        return color, size, parity
+
+    def frequency_number_distribution(self, sequence: Sequence[int], window: int = 100) -> Dict[int, float]:
+        scores = {n: 1.0 for n in NUMBER_STATES}
+        for value in list(sequence)[-window:]:
+            if value in scores:
+                scores[value] += 1.0
+        return self.normalize(scores, NUMBER_STATES)
+
+    def candidate_number_distributions(self, sequence: Sequence[int]) -> Dict[str, Dict[int, float]]:
+        ema = self.ema_distribution(sequence, NUMBER_STATES)
+        markov, _ = self.markov_distribution(sequence, NUMBER_STATES)
+        pattern, _, _ = self.ngram_distribution(sequence, NUMBER_STATES, max_order=3)
+        freq = self.frequency_number_distribution(sequence)
+        return {"ema": ema, "markov": markov, "pattern": pattern, "frequency": freq}
+
+    def walk_forward_model_scores(
+        self,
+        sequence: Sequence[int],
+        lookback: int = 80,
+        min_train: int = 30,
+    ) -> Dict[str, Dict[str, float]]:
+        names = ("ema", "markov", "pattern", "frequency")
+        stats = {name: {"correct": 0.0, "tested": 0.0, "logloss": 0.0} for name in names}
+
+        start = max(min_train, len(sequence) - lookback)
+        for target_index in range(start, len(sequence)):
+            train = list(sequence[:target_index])
+            actual = int(sequence[target_index])
+            candidates = self.candidate_number_distributions(train)
+
+            for name, dist in candidates.items():
+                predicted = max(dist, key=dist.get)
+                stats[name]["tested"] += 1.0
+                stats[name]["correct"] += float(predicted == actual)
+                stats[name]["logloss"] += -math.log(max(float(dist.get(actual, 0.0)), 1e-9))
+
+        for name in names:
+            tested = stats[name]["tested"]
+            if tested:
+                stats[name]["accuracy"] = stats[name]["correct"] / tested
+                stats[name]["logloss"] /= tested
+            else:
+                stats[name]["accuracy"] = 0.10
+                stats[name]["logloss"] = math.log(10.0)
+        return stats
+
+    def adaptive_number_weights(self, sequence: Sequence[int]) -> Tuple[Dict[str, float], Dict[str, Dict[str, float]]]:
+        stats = self.walk_forward_model_scores(sequence)
+        raw = {}
+
+        # Weight by out-of-sample probability quality, not in-sample fit.
+        # exp(-logloss) is bounded and avoids a lucky tiny sample dominating.
+        for name, row in stats.items():
+            tested = max(row["tested"], 1.0)
+            reliability = min(tested / 50.0, 1.0)
+            quality = math.exp(-float(row["logloss"]))
+            raw[name] = 0.05 + reliability * quality
+
+        total = sum(raw.values())
+        return ({name: value / total for name, value in raw.items()}, stats)
+
+    def predict_number(self, games: List[Dict[str, Any]]) -> Dict[str, Any]:
+        sequence = [int(game["number"]) for game in games]
+        candidates = self.candidate_number_distributions(sequence)
+        weights, backtest = self.adaptive_number_weights(sequence)
+
+        distribution = {
+            n: sum(weights[name] * candidates[name][n] for name in candidates)
+            for n in NUMBER_STATES
+        }
+        distribution = self.normalize(distribution, NUMBER_STATES)
+        ordered = sorted(distribution.items(), key=lambda item: item[1], reverse=True)
+
+        prediction = int(ordered[0][0])
+        score = float(ordered[0][1])
+        margin = score - float(ordered[1][1])
+
+        return {
+            "prediction": prediction,
+            "score": score,
+            "margin": margin,
+            "entropy": self.normalized_entropy(distribution),
+            "distribution": distribution,
+            "weights": weights,
+            "backtest": backtest,
+        }
+
+    # ---------------------------------------------------------
+    # Prediction decision
+    # ---------------------------------------------------------
+
+    @staticmethod
+    def agreement_count(
+        joint_prediction: Tuple[str, str, str],
+        color_prediction: str,
+        size_prediction: str,
+        parity_prediction: str,
+    ) -> int:
+        expected = (
+            color_prediction,
+            size_prediction,
+            parity_prediction,
+        )
+
+        return sum(
+            1
+            for joint_value, individual_value in zip(joint_prediction, expected)
+            if joint_value == individual_value
+        )
+
+    @staticmethod
+    def signal_quality(
+        joint: Dict[str, Any],
+        agreement: int,
+    ) -> str:
+        entropy = float(joint["entropy"])
+        score = float(joint["score"])
+        margin = float(joint["margin"])
+        support = int(joint["total_support"])
+
+        if entropy >= 0.90:
+            return "SKIP"
+
+        if support < 5:
+            return "SKIP"
+
+        if agreement <= 1:
+            return "SKIP"
+
+        if (
+            entropy <= 0.62
+            and score >= 0.45
+            and margin >= 0.10
+            and agreement == 3
+        ):
+            return "HIGH"
+
+        return "MEDIUM"
+
+    def build_prediction(self, games: List[Dict[str, Any]]) -> Dict[str, Any]:
+        number = self.predict_number(games)
+        color_value, size_value, parity_value = self.features_from_number(number["prediction"])
+
+        # Keep the old feature models only as diagnostics/agreement checks.
+        color = self.predict_feature(games, "color", COLOR_STATES)
+        size = self.predict_feature(games, "size", SIZE_STATES)
+        parity = self.predict_feature(games, "parity", PARITY_STATES)
+
+        joint_state = (color_value, size_value, parity_value)
+        agreement = self.agreement_count(
+            joint_state,
+            color["prediction"],
+            size["prediction"],
+            parity["prediction"],
+        )
+
+        # V7 confidence is deliberately conservative. A ten-way digit model
+        # should not claim HIGH confidence from a small sample.
+        signal = "SKIP"
+        if number["score"] >= 0.18 and number["margin"] >= 0.025 and agreement >= 2:
+            signal = "MEDIUM"
+
+        joint = {
+            "prediction": joint_state,
+            "score": number["score"],
+            "margin": number["margin"],
+            "entropy": number["entropy"],
+            "distribution": {},
+            "weights": number["weights"],
+            "total_support": len(games),
+            "volatility": self.combined_volatility(games),
+            "regime": self.regime_from_volatility(self.combined_volatility(games)),
+            "number_prediction": number["prediction"],
+            "number_distribution": number["distribution"],
+            "backtest": number["backtest"],
+        }
+
+        return {
+            "joint": joint,
+            "number": number,
+            "color": color,
+            "size": size,
+            "parity": parity,
+            "agreement": agreement,
+            "signal": signal,
+        }
+
+    # ---------------------------------------------------------
+    # Save / verify predictions
+    # ---------------------------------------------------------
+
+    @staticmethod
+    def get_next_issue(current_issue: str) -> str:
+        try:
+            return str(int(current_issue) + 1)
+        except ValueError:
+            return f"{current_issue}_NEXT"
+
+    def save_next_prediction(self, games: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if len(games) < MIN_HISTORY:
+            return None
+
+        latest = games[-1]
+        target_issue = self.get_next_issue(latest["issue"])
+
+        if self.prediction_exists(target_issue):
+            return None
+
+        result = self.build_prediction(games)
+
+        joint_state = result["joint"]["prediction"]
+        number_prediction = int(result["number"]["prediction"])
+        color_prediction = str(joint_state[0])
+        size_prediction = str(joint_state[1])
+        parity_prediction = str(joint_state[2])
+
+        with self._connect() as conn:
+            conn.execute("""
+                INSERT OR IGNORE INTO predictions (
+                    issue,
+                    based_on_issue,
+
+                    joint_state,
+                    predicted_color,
+                    predicted_size,
+                    predicted_parity,
+                    predicted_number,
+
+                    joint_score,
+                    joint_margin,
+                    joint_entropy,
+                    joint_support,
+                    agreement_count,
+                    regime,
+                    volatility,
+                    signal,
+
+                    color_score,
+                    size_score,
+                    parity_score,
+
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                target_issue,
+                latest["issue"],
+
+                self.joint_key(joint_state),
+                color_prediction,
+                size_prediction,
+                parity_prediction,
+                number_prediction,
+
+                float(result["joint"]["score"]),
+                float(result["joint"]["margin"]),
+                float(result["joint"]["entropy"]),
+                int(result["joint"]["total_support"]),
+                int(result["agreement"]),
+                str(result["joint"]["regime"]),
+                float(result["joint"]["volatility"]),
+                str(result["signal"]),
+
+                float(result["color"]["score"]),
+                float(result["size"]["score"]),
+                float(result["parity"]["score"]),
+
+                int(time.time()),
+            ))
+            conn.commit()
+
+        return self.get_prediction(target_issue)
+
+    def verify_pending_predictions(self) -> int:
+        verified_now = 0
+
+        with self._connect() as conn:
+            pending = conn.execute("""
+                SELECT *
+                FROM predictions
+                WHERE verified = 0
+                ORDER BY created_at ASC
+            """).fetchall()
+
+            for prediction in pending:
+                actual = conn.execute("""
+                    SELECT *
+                    FROM rounds
+                    WHERE issue = ?
+                """, (prediction["issue"],)).fetchone()
+
+                if actual is None:
+                    continue
+
+                joint_win = int(
+                    prediction["predicted_color"] == actual["color"]
+                    and prediction["predicted_size"] == actual["size"]
+                    and prediction["predicted_parity"] == actual["parity"]
+                )
+
+                color_win = int(prediction["predicted_color"] == actual["color"])
+                size_win = int(prediction["predicted_size"] == actual["size"])
+                parity_win = int(prediction["predicted_parity"] == actual["parity"])
+
+                conn.execute("""
+                    UPDATE predictions
+                    SET
+                        verified = 1,
+                        actual_color = ?,
+                        actual_size = ?,
+                        actual_parity = ?,
+                        joint_win = ?,
+                        color_win = ?,
+                        size_win = ?,
+                        parity_win = ?
+                    WHERE issue = ?
+                """, (
+                    actual["color"],
+                    actual["size"],
+                    actual["parity"],
+                    joint_win,
+                    color_win,
+                    size_win,
+                    parity_win,
+                    prediction["issue"],
+                ))
+
+                verified_now += 1
+
+            conn.commit()
+
+        return verified_now
+
+    # ---------------------------------------------------------
+    # Backfill and worker
+    # ---------------------------------------------------------
+
+    def backfill(self) -> None:
+        existing = self.count_rounds()
+
+        if existing >= BACKFILL_TARGET:
+            return
+
+        seen = set()
+        page_no = 1
+        max_pages = 25
+
+        while (
+            self.count_rounds() < BACKFILL_TARGET
+            and page_no <= max_pages
+            and not self.stop_event.is_set()
+        ):
+            data = self.fetch_history(
+                page_no=page_no,
+                page_size=BACKFILL_PAGE_SIZE,
+            )
+
+            if not data or data.get("code") != 0:
+                break
+
+            games = self.parse_api_history(data)
+            if not games:
+                break
+
+            inserted = 0
+
+            for game in games:
+                if game["issue"] in seen:
+                    continue
+
+                seen.add(game["issue"])
+
+                if self.save_round(game):
+                    inserted += 1
+
+                if self.count_rounds() >= BACKFILL_TARGET:
+                    break
+
+            try:
+                total_page = int(data.get("data", {}).get("totalPage", page_no))
+            except Exception:
+                total_page = page_no
+
+            if page_no >= total_page:
+                break
+
+            # API may ignore pageNo/pageSize and return the same records.
+            if inserted == 0:
+                break
+
+            page_no += 1
+            time.sleep(0.15)
+
+    def poll_once(self) -> None:
+        self.last_poll_at = int(time.time())
+
+        data = self.fetch_history(page_no=1, page_size=100)
+
+        if not data or data.get("code") != 0:
+            return
+
+        games = self.parse_api_history(data)
+
+        for game in games:
+            self.save_round(game)
+
+        self.verify_pending_predictions()
+
+        stored = self.load_history(HISTORY_LIMIT)
+
+        if not stored:
+            return
+
+        latest_issue = stored[-1]["issue"]
+
+        if latest_issue != self.last_seen_issue:
+            self.last_seen_issue = latest_issue
+            self.save_next_prediction(stored)
+
+    def worker_loop(self) -> None:
+        try:
+            self.backfill()
+        except Exception as exc:
+            self.last_error = f"Backfill: {type(exc).__name__}: {exc}"
+
+        while not self.stop_event.is_set():
+            try:
+                self.poll_once()
+            except Exception as exc:
+                self.last_error = f"Poll: {type(exc).__name__}: {exc}"
+
+            self.stop_event.wait(POLL_SECONDS)
+
+    def start_worker(self) -> None:
+        with self.lock:
+            if self.worker and self.worker.is_alive():
+                return
+
+            self.stop_event.clear()
+            self.worker = threading.Thread(
+                target=self.worker_loop,
+                name="predictor-worker",
+                daemon=True,
+            )
+            self.worker.start()
+
+    def stop_worker(self) -> None:
+        self.stop_event.set()
+
+        if self.worker and self.worker.is_alive():
+            self.worker.join(timeout=3)
+
+    # ---------------------------------------------------------
+    # API serialization helpers
+    # ---------------------------------------------------------
+
+    def get_latest_round(self) -> Optional[Dict[str, Any]]:
+        history = self.load_history(1)
+        return history[-1] if history else None
+
+    def get_prediction(self, issue: str) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM predictions WHERE issue = ?",
+                (issue,),
+            ).fetchone()
+
+        return dict(row) if row else None
+
+    def get_latest_prediction(self) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute("""
+                SELECT *
+                FROM predictions
+                ORDER BY created_at DESC
+                LIMIT 1
+            """).fetchone()
+
+        return dict(row) if row else None
+
+    def recent_rounds(self, limit: int = 30) -> List[Dict[str, Any]]:
+        limit = max(1, min(limit, 200))
+
+        with self._connect() as conn:
+            rows = conn.execute("""
+                SELECT issue, number, color, size, parity, seen_at
+                FROM rounds
+                ORDER BY
+                    CASE
+                        WHEN issue GLOB '[0-9]*' THEN CAST(issue AS INTEGER)
+                        ELSE seen_at
+                    END DESC
+                LIMIT ?
+            """, (limit,)).fetchall()
+
+        return [dict(row) for row in rows]
+
+    def recent_predictions(self, limit: int = 30) -> List[Dict[str, Any]]:
+        limit = max(1, min(limit, 200))
+
+        with self._connect() as conn:
+            rows = conn.execute("""
+                SELECT *
+                FROM predictions
+                ORDER BY created_at DESC
+                LIMIT ?
+            """, (limit,)).fetchall()
+
+        return [dict(row) for row in rows]
+
+    def accuracy_stats(self, window: int = 200) -> Dict[str, Any]:
+        window = max(1, min(window, 1000))
+
+        with self._connect() as conn:
+            rows = conn.execute("""
+                SELECT
+                    joint_win,
+                    color_win,
+                    size_win,
+                    parity_win,
+                    signal
+                FROM predictions
+                WHERE verified = 1
+                ORDER BY created_at DESC
+                LIMIT ?
+            """, (window,)).fetchall()
+
+        def metric(field: str) -> Dict[str, Any]:
+            values = [
+                int(row[field])
+                for row in rows
+                if row[field] is not None
+            ]
+
+            if not values:
+                return {
+                    "correct": 0,
+                    "tested": 0,
+                    "accuracy": None,
+                }
+
+            correct = sum(values)
+            tested = len(values)
+
+            return {
+                "correct": correct,
+                "tested": tested,
+                "accuracy": correct / tested,
+            }
+
+        signal_counts = defaultdict(int)
+        for row in rows:
+            signal_counts[row["signal"]] += 1
+
+        return {
+            "window": window,
+            "joint": metric("joint_win"),
+            "color": metric("color_win"),
+            "size": metric("size_win"),
+            "parity": metric("parity_win"),
+            "signals": dict(signal_counts),
+        }
+
+    def status(self) -> Dict[str, Any]:
+        return {
+            "service": "online",
+            "worker_running": bool(self.worker and self.worker.is_alive()),
+            "db_path": DB_PATH,
+            "stored_rounds": self.count_rounds(),
+            "history_limit": HISTORY_LIMIT,
+            "minimum_history": MIN_HISTORY,
+            "last_poll_at": self.last_poll_at,
+            "last_api_ok_at": self.last_api_ok_at,
+            "last_error": self.last_error,
+        }
+
+
+engine = PredictorEngine()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    engine.start_worker()
+    yield
+    engine.stop_worker()
+
+
+app = FastAPI(
+    title="WinGo Statistical Predictor API",
+    version="8.0.0",
+    lifespan=lifespan,
+)
+
+cors_raw = os.getenv("CORS_ORIGINS", "*").strip()
+
+if cors_raw == "*":
+    allow_origins = ["*"]
+else:
+    allow_origins = [
+        origin.strip()
+        for origin in cors_raw.split(",")
+        if origin.strip()
+    ]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=allow_origins,
+    allow_credentials=False,
+    allow_methods=["GET", "POST"],
+    allow_headers=["*"],
+)
+
+
+@app.get("/")
+def root():
+    return {
+        "name": "WinGo Statistical Predictor API",
+        "version": "8.0.0",
+        "status": "online",
+        "docs": "/docs",
+    }
+
+
+@app.get("/health")
+def health():
+    return engine.status()
+
+
+@app.get("/api/dashboard")
+def dashboard():
+    return {
+        "status": engine.status(),
+        "latest_round": engine.get_latest_round(),
+        "latest_prediction": engine.get_latest_prediction(),
+        "accuracy": engine.accuracy_stats(200),
+        "history": engine.recent_rounds(20),
+        "predictions": engine.recent_predictions(20),
+    }
+
+
+@app.get("/api/history")
+def history(limit: int = 30):
+    return {
+        "items": engine.recent_rounds(limit),
+    }
+
+
+@app.get("/api/predictions")
+def predictions(limit: int = 30):
+    return {
+        "items": engine.recent_predictions(limit),
+    }
+
+
+@app.get("/api/stats")
+def stats(window: int = 200):
+    return engine.accuracy_stats(window)
+
+
+INGEST_SECRET = os.getenv("INGEST_SECRET", "")
+
+class RoundInput(BaseModel):
+    issue: str
+    number: int
+    color: str
+    secret: str
+
+@app.post("/api/ingest")
+def ingest_round(round_data: RoundInput):
+    if not INGEST_SECRET or round_data.secret != INGEST_SECRET:
+        return {"ok": False, "error": "Unauthorized"}
+
+    color = engine.parse_color(round_data.color)
+    if color is None:
+        return {"ok": False, "error": "Invalid color"}
+
+    number = int(round_data.number)
+    if number < 0 or number > 9:
+        return {"ok": False, "error": "Invalid number"}
+
+    game = {
+        "issue": str(round_data.issue),
+        "number": number,
+        "color": color,
+        "size": "big" if number >= 5 else "small",
+        "parity": "even" if number % 2 == 0 else "odd",
+    }
+
+    inserted = engine.save_round(game)
+    engine.verify_pending_predictions()
+    history = engine.load_history(HISTORY_LIMIT)
+    prediction = engine.save_next_prediction(history) if inserted else None
+
+    firebase_error = None
+    if inserted:
+        try:
+            db = get_firestore()
+            db.collection("rounds").document(game["issue"]).set(game, merge=True)
+            if prediction:
+                db.collection("predictions").document(str(prediction["issue"])).set({k:v for k,v in prediction.items() if v is not None}, merge=True)
+        except Exception as exc:
+            firebase_error = f"{type(exc).__name__}: {exc}"
+
+    return {
+        "ok": True,
+        "inserted": inserted,
+        "round": game,
+        "stored_rounds": engine.count_rounds(),
+        "prediction": prediction,
+        "firebase_error": firebase_error,
+    }

@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>WinGo V9 Research</title>
+<title>WinGo V9.3 Flash + PKR Simulator</title>
 <style>
 :root{
   --bg:#05070b;--s:#0b0f16;--s2:#111722;--s3:#151d2a;--b:#202938;
@@ -26,291 +26,329 @@ h1{margin:0;font-size:24px;letter-spacing:.08em}
 .signal{font-size:36px;font-weight:850}
 .big{color:var(--y)}.small{color:var(--bl)}.predict{color:var(--g)}.skip{color:var(--m)}
 .win{color:var(--g)!important}.loss{color:var(--r)!important}.pending{color:var(--m)!important}
-.bar{height:10px;background:#06090e;border-radius:99px;overflow:hidden;border:1px solid var(--b);margin-top:10px}.bar div{height:100%;background:linear-gradient(90deg,var(--bl),var(--g));width:0}
-.modelrow{display:grid;grid-template-columns:120px 1fr 55px;gap:10px;align-items:center;margin-top:10px;font-size:12px}
+.bar{height:10px;background:#06090e;border-radius:99px;overflow:hidden;border:1px solid var(--b);margin-top:10px}
+.bar div{height:100%;background:linear-gradient(90deg,var(--bl),var(--g));width:0}
+.modelrow{display:grid;grid-template-columns:130px 1fr 58px;gap:10px;align-items:center;margin-top:10px;font-size:12px}
 .mini{height:7px;background:#06090e;border-radius:99px;overflow:hidden}.mini i{display:block;height:100%;background:var(--bl)}
 .section{margin-top:12px}.section h2{font-size:14px;letter-spacing:.08em;text-transform:uppercase;margin:0 0 12px}
 table{width:100%;border-collapse:collapse;font-size:12px}th,td{padding:10px 8px;border-bottom:1px solid var(--b);text-align:left}th{color:var(--m)}
 .reason{display:inline-block;padding:4px 8px;border:1px solid var(--b);border-radius:99px;color:var(--m);margin:4px 4px 0 0;font-size:11px}
 .err{color:var(--r)}
-
-.compare-wrap{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
-.compare-box{background:linear-gradient(180deg,var(--s3),#0b1018);border:1px solid var(--b);border-radius:14px;padding:15px}
-.compare-title{font-size:11px;letter-spacing:.1em;color:var(--m);text-transform:uppercase;margin-bottom:9px}
-.compare-acc{font-size:28px;font-weight:850;line-height:1}
-.compare-record{font:12px ui-monospace,monospace;color:var(--m);margin-top:8px}
-.compare-meta{display:grid;grid-template-columns:1fr 1fr;gap:7px;margin-top:12px}
-.compare-meta div{background:#080c12;border:1px solid var(--b);border-radius:9px;padding:8px}
-.compare-meta span{display:block;color:var(--m);font-size:9px;letter-spacing:.08em;text-transform:uppercase}
-.compare-meta b{display:block;margin-top:3px;font-size:13px}
-.delta{font-size:12px;margin-top:9px;color:var(--m)}
-.latest-result{font-size:24px;font-weight:850;margin-top:6px}
-
-@media(max-width:1100px){.grid{grid-template-columns:repeat(3,1fr)}}
-@media(max-width:850px){.grid{grid-template-columns:1fr 1fr}.two,.cols,.compare-wrap{grid-template-columns:1fr}.w{padding:12px}}
-@media(max-width:480px){.grid{grid-template-columns:1fr}.top{flex-direction:column;align-items:flex-start}}
+.metric-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
+.metric{background:#080c12;border:1px solid var(--b);border-radius:12px;padding:12px}
+.metric span{display:block;color:var(--m);font-size:10px;letter-spacing:.08em;text-transform:uppercase}
+.metric b{display:block;font-size:20px;margin-top:5px}
+.form-grid{display:grid;grid-template-columns:repeat(5,1fr);gap:10px}
+.field label{display:block;color:var(--m);font-size:10px;letter-spacing:.08em;text-transform:uppercase;margin-bottom:6px}
+.field input{width:100%;padding:11px 12px;border-radius:10px;border:1px solid var(--b);background:#080c12;color:var(--t);font-size:16px}
+button{padding:11px 16px;border:1px solid var(--b);border-radius:10px;background:#172131;color:var(--t);font-weight:800;cursor:pointer}
+button:hover{border-color:#40516d}
+button:disabled{opacity:.55;cursor:not-allowed}
+.sim-head{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}
+.sim-status{font:12px ui-monospace,monospace;color:var(--m)}
+.note{padding:10px 12px;border:1px solid var(--b);border-radius:10px;background:#080c12;color:var(--m);font-size:12px}
+.scroll{overflow:auto}
+@media(max-width:1100px){.grid{grid-template-columns:repeat(3,1fr)}.form-grid{grid-template-columns:repeat(3,1fr)}}
+@media(max-width:850px){.grid{grid-template-columns:1fr 1fr}.two,.cols{grid-template-columns:1fr}.metric-grid{grid-template-columns:1fr 1fr}.form-grid{grid-template-columns:1fr 1fr}.w{padding:12px}}
+@media(max-width:480px){.grid,.metric-grid,.form-grid{grid-template-columns:1fr}.top{flex-direction:column;align-items:flex-start}}
 </style>
 </head>
 <body>
 <div class="w">
   <div class="top">
     <div>
-      <h1>WINGO V9.1</h1>
-      <div class="muted">Leak-free Big/Small research engine · walk-forward validation</div>
+      <h1>WINGO V9.3 FLASH</h1>
+      <div class="muted">Strict Big/Small research engine · walk-forward calibration · PKR virtual simulator</div>
     </div>
     <div class="badge" id="status">CONNECTING</div>
   </div>
 
-  <!-- Top stats -->
   <div class="grid">
     <div class="card"><div class="label">Stored rounds</div><div class="value" id="stored">—</div><div class="sub">Firestore-backed history</div></div>
     <div class="card"><div class="label">OOS accuracy</div><div class="value" id="oos">—</div><div class="sub" id="oosn">walk-forward</div></div>
-    <div class="card"><div class="label">Brier score</div><div class="value" id="brier">—</div><div class="sub">lower is better</div></div>
-    <div class="card"><div class="label">Predict coverage</div><div class="value" id="cov">—</div><div class="sub">signal-only coverage</div></div>
-    <div class="card"><div class="label">Wins</div><div class="value win" id="wins">—</div><div class="sub" id="winsSub">verified predictions</div></div>
-    <div class="card"><div class="label">Losses</div><div class="value loss" id="losses">—</div><div class="sub" id="lossesSub">verified predictions</div></div>
+    <div class="card"><div class="label">Predict coverage</div><div class="value" id="cov">—</div><div class="sub">strict signal coverage</div></div>
+    <div class="card"><div class="label">Regime</div><div class="value" id="regTop">—</div><div class="sub" id="choppy">choppy score</div></div>
+    <div class="card"><div class="label">Agreement</div><div class="value" id="agreeTop">—</div><div class="sub">3 diversified models</div></div>
+    <div class="card"><div class="label">Support</div><div class="value" id="support">—</div><div class="sub">walk-forward samples</div></div>
   </div>
 
-  <!-- Main prediction -->
   <div class="two">
     <div class="card">
       <div class="label">Next round research output</div>
       <div class="signal skip" id="pred">WAIT</div>
-      <div class="sub" id="issue">—</div>
+      <div class="sub" id="issue">V9.3 Flash</div>
+
       <div style="margin-top:16px">
-        <div class="label">Calibrated P(Big)</div>
-        <div class="value" id="pbig">—</div>
-        <div class="bar"><div id="pbar"></div></div>
+        <div class="label">Calibrated confidence</div>
+        <div class="value" id="conf">—</div>
+        <div class="bar"><div id="confbar"></div></div>
       </div>
+
       <div style="margin-top:14px">
         <span class="badge" id="sig">SKIP</span>
         <span class="badge" id="reg">—</span>
         <span class="badge" id="agree">—</span>
+        <span class="badge" id="threshold">—</span>
       </div>
       <div id="reasons"></div>
     </div>
 
     <div class="card">
-      <div class="label">Model probabilities</div>
+      <div class="label">Diversified model probabilities · P(Big)</div>
       <div id="models"></div>
-      <div class="sub" style="margin-top:14px" id="cal">—</div>
-    </div>
-  </div>
-
-  <!-- Compare panel -->
-  <div class="card section">
-    <h2>Performance Compare Panel</h2>
-    <div class="compare-wrap">
-      <div class="compare-box">
-        <div class="compare-title">All Verified Predictions</div>
-        <div class="compare-acc" id="cmpAllAcc">—</div>
-        <div class="compare-record" id="cmpAllRecord">0W / 0L</div>
-        <div class="compare-meta">
-          <div><span>Tested</span><b id="cmpAllTested">0</b></div>
-          <div><span>Coverage</span><b>100%</b></div>
-        </div>
-      </div>
-
-      <div class="compare-box">
-        <div class="compare-title">PREDICT Signals Only</div>
-        <div class="compare-acc" id="cmpSigAcc">—</div>
-        <div class="compare-record" id="cmpSigRecord">0W / 0L</div>
-        <div class="compare-meta">
-          <div><span>Tested</span><b id="cmpSigTested">0</b></div>
-          <div><span>Coverage</span><b id="cmpSigCoverage">—</b></div>
-        </div>
-        <div class="delta" id="cmpDelta">Accuracy delta: —</div>
-      </div>
-
-      <div class="compare-box">
-        <div class="compare-title">Walk-Forward Validation</div>
-        <div class="compare-acc" id="cmpOosAcc">—</div>
-        <div class="compare-record" id="cmpOosRecord">OOS research set</div>
-        <div class="compare-meta">
-          <div><span>Raw Brier</span><b id="cmpRawBrier">—</b></div>
-          <div><span>Calibrated</span><b id="cmpCalAcc">—</b></div>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <!-- Latest Win/Loss -->
-  <div class="cols">
-    <div class="card section">
-      <h2>Latest Verified Win / Loss</h2>
-      <div class="label" id="latestResultIssue">Issue —</div>
-      <div class="latest-result pending" id="latestResult">PENDING</div>
-      <div class="sub" id="latestResultInfo">Waiting for a verified prediction</div>
-    </div>
-
-    <div class="card section">
-      <h2>Win / Loss Record</h2>
-      <div class="compare-meta">
-        <div><span>Total Wins</span><b class="win" id="recordWins">0</b></div>
-        <div><span>Total Losses</span><b class="loss" id="recordLosses">0</b></div>
-        <div><span>Win Rate</span><b id="recordRate">—</b></div>
-        <div><span>Signal Win Rate</span><b id="signalRate">—</b></div>
-      </div>
+      <div class="sub" style="margin-top:14px" id="pbig">Calibrated P(Big): —</div>
     </div>
   </div>
 
   <div class="cols">
     <div class="card section">
-      <h2>Confidence / Coverage Curve</h2>
-      <table><thead><tr><th>Threshold</th><th>Coverage</th><th>Accuracy</th><th>N</th></tr></thead><tbody id="curve"></tbody></table>
+      <h2>Pattern / Regime Diagnostics</h2>
+      <div class="metric-grid">
+        <div class="metric"><span>Entropy 20</span><b id="entropy">—</b></div>
+        <div class="metric"><span>Transition Entropy</span><b id="tEntropy">—</b></div>
+        <div class="metric"><span>Switch Rate</span><b id="switchRate">—</b></div>
+        <div class="metric"><span>Sequence Stability</span><b id="stability">—</b></div>
+      </div>
     </div>
     <div class="card section">
-      <h2>Top Logistic Contributions</h2>
-      <table><thead><tr><th>Feature</th><th>Direction</th><th>Contribution</th></tr></thead><tbody id="contrib"></tbody></table>
-    </div>
-  </div>
-
-  <div class="cols">
-    <div class="card section">
-      <h2>Feature Ablation</h2>
-      <table><thead><tr><th>Through Group</th><th>Features</th><th>Accuracy</th><th>Brier</th></tr></thead><tbody id="abl"></tbody></table>
-    </div>
-    <div class="card section">
-      <h2>Recent Rounds</h2>
-      <table><thead><tr><th>Issue</th><th>#</th><th>Size</th><th>Color</th></tr></thead><tbody id="hist"></tbody></table>
+      <h2>Flash Features</h2>
+      <div class="metric-grid">
+        <div class="metric"><span>EMA 3</span><b id="ema3">—</b></div>
+        <div class="metric"><span>EMA 8</span><b id="ema8">—</b></div>
+        <div class="metric"><span>EMA 20</span><b id="ema20">—</b></div>
+        <div class="metric"><span>Gap to Mean 10</span><b id="gapMean">—</b></div>
+      </div>
+      <div class="sub" style="margin-top:10px" id="gaps">Gap since Big: — · Gap since Small: —</div>
     </div>
   </div>
 
   <div class="card section">
-    <h2>Recent V9 Predictions</h2>
-    <table>
-      <thead><tr><th>Issue</th><th>Prediction</th><th>Confidence</th><th>Signal</th><th>Actual</th><th>Result</th></tr></thead>
-      <tbody id="preds"></tbody>
-    </table>
+    <div class="sim-head">
+      <div>
+        <h2 style="margin-bottom:4px">PKR Virtual Simulator</h2>
+        <div class="sub">Historical simulation only — no live wallet or real bet placement.</div>
+      </div>
+      <div class="sim-status" id="simStatus">READY</div>
+    </div>
+
+    <div class="form-grid" style="margin-top:14px">
+      <div class="field">
+        <label>Starting Balance (PKR)</label>
+        <input id="startBalance" type="number" min="1" step="1" value="1000">
+      </div>
+      <div class="field">
+        <label>Target Balance (PKR)</label>
+        <input id="targetBalance" type="number" min="1" step="1" value="1500">
+      </div>
+      <div class="field">
+        <label>Virtual Stake %</label>
+        <input id="stakePercent" type="number" min="0.1" max="5" step="0.1" value="2">
+      </div>
+      <div class="field">
+        <label>Max Historical Rounds</label>
+        <input id="maxRounds" type="number" min="1" max="1000" step="1" value="200">
+      </div>
+      <div class="field" style="display:flex;align-items:end">
+        <button id="runSim" type="button" style="width:100%">RUN SIMULATION</button>
+      </div>
+    </div>
+
+    <div class="metric-grid" style="margin-top:14px">
+      <div class="metric"><span>Ending Balance</span><b id="simEnd">—</b></div>
+      <div class="metric"><span>Max Balance</span><b id="simMax">—</b></div>
+      <div class="metric"><span>Profit / Loss</span><b id="simPnl">—</b></div>
+      <div class="metric"><span>Return</span><b id="simReturn">—</b></div>
+      <div class="metric"><span>Wins / Losses</span><b id="simRecord">—</b></div>
+      <div class="metric"><span>Hit Rate</span><b id="simHit">—</b></div>
+      <div class="metric"><span>Skips</span><b id="simSkips">—</b></div>
+      <div class="metric"><span>Stop Reason</span><b id="simStop" style="font-size:14px">—</b></div>
+    </div>
+
+    <div class="note" style="margin-top:14px">
+      Simulator fixed-fraction virtual stake use karta hai. Ye sirf historical backtest hai; live money management, Kelly, Martingale ya wallet automation nahi karta.
+    </div>
+  </div>
+
+  <div class="card section">
+    <h2>Simulation History</h2>
+    <div class="scroll">
+      <table>
+        <thead>
+          <tr><th>Issue</th><th>Prediction</th><th>Actual</th><th>Confidence</th><th>Virtual Stake</th><th>Result</th><th>Balance</th></tr>
+        </thead>
+        <tbody id="simRows"><tr><td colspan="7">Run a simulation to see history.</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="card section">
+    <h2>Recent Rounds</h2>
+    <div class="scroll">
+      <table>
+        <thead><tr><th>Issue</th><th>#</th><th>Size</th><th>Color</th></tr></thead>
+        <tbody id="hist"><tr><td colspan="4">Loading…</td></tr></tbody>
+      </table>
+    </div>
   </div>
 </div>
 
 <script>
-const $=x=>document.getElementById(x),q=new URLSearchParams(location.search);
+const $=x=>document.getElementById(x);
+const q=new URLSearchParams(location.search);
 const API=(q.get('api')||localStorage.getItem('wingo_v9_api')||'https://wingo-v8-cloud.onrender.com').replace(/\/$/,'');
 localStorage.setItem('wingo_v9_api',API);
+
 const pct=v=>(v==null?'—':(Number(v)*100).toFixed(1)+'%');
+const pkr=v=>(v==null?'—':'PKR '+Number(v).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2}));
 const num=(v,d=3)=>(v==null?'—':Number(v).toFixed(d));
 
-function model(n,p){
-  let x=Math.max(0,Math.min(1,Number(p||0)));
-  return `<div class="modelrow"><span>${n}</span><div class="mini"><i style="width:${x*100}%"></i></div><b>${(x*100).toFixed(1)}%</b></div>`;
+function model(name,p){
+  const x=Math.max(0,Math.min(1,Number(p||0)));
+  return `<div class="modelrow"><span>${name}</span><div class="mini"><i style="width:${x*100}%"></i></div><b>${(x*100).toFixed(1)}%</b></div>`;
 }
 
-function record(metric){
-  metric=metric||{};
-  const tested=Number(metric.tested||0);
-  const wins=Number(metric.correct||0);
-  return {tested,wins,losses:Math.max(0,tested-wins),accuracy:metric.accuracy};
-}
-
-function render(d){
-  const refreshState=d.model_refresh||{};
-  $('status').textContent=`V${d.version} · ${refreshState.running?'MODEL REFRESH':'ONLINE'}`;
+function renderFlash(p, dashboard){
+  $('status').textContent='V9.3 · ONLINE';
   $('status').className='badge';
 
-  let st=d.status||{}, wf=d.walk_forward||{}, raw=wf.raw||{}, calEval=wf.calibrated_eval||{}, a=d.accuracy||{}, p=d.prediction||{};
-  const all=record(a.all_verified);
-  const sigOnly=record(a.predict_only);
+  const st=(dashboard&&dashboard.status)||{};
+  $('stored').textContent=st.stored_rounds??(dashboard&&dashboard.stored_rounds)??'—';
 
-  $('stored').textContent=st.stored_rounds??0;
-  $('oos').textContent=pct(raw.accuracy);
-  $('oosn').textContent=`${raw.samples??0} out-of-sample predictions`;
-  $('brier').textContent=num(raw.brier);
-  $('cov').textContent=pct(a.coverage);
-  $('wins').textContent=all.wins;
-  $('losses').textContent=all.losses;
-  $('winsSub').textContent=`${all.tested} verified total`;
-  $('lossesSub').textContent=`${all.tested} verified total`;
-
-  if(p.ready){
-    $('pred').textContent=String(p.predicted_size||'—').toUpperCase();
-    $('pred').className='signal '+(p.predicted_size==='big'?'big':'small');
-    $('issue').textContent=`Issue ${p.issue}`;
-    $('pbig').textContent=pct(p.p_big_calibrated);
-    $('pbar').style.width=`${Number(p.p_big_calibrated||0)*100}%`;
-    $('sig').textContent=p.signal||'SKIP';
-    $('sig').className='badge '+(p.signal==='PREDICT'?'predict':'skip');
-    $('reg').textContent=`REGIME ${p.regime||'—'}`;
-    $('agree').textContent=`AGREE ${p.agreement||0}/3`;
-    $('reasons').innerHTML=(p.signal_reasons||[]).map(x=>`<span class="reason">${x}</span>`).join('');
-    let m=p.models||{};
-    $('models').innerHTML=model('Logistic',m.logistic)+model('Boosted tree',m.boosted_tree)+model('Markov',m.markov);
-    $('cal').textContent=`Calibration: ${(p.calibration||{}).method||'none'} · OOS ${(p.calibration||{}).oos_samples||0} · threshold ${pct(p.threshold)}`;
-  }else{
+  if(!p || !p.ready){
     $('pred').textContent='WAIT';
     $('pred').className='signal skip';
-    $('issue').textContent=p.reason||((d.model_refresh||{}).running?'model refresh in progress':'insufficient history');
+    $('issue').textContent=(p&&p.reason)||'insufficient history';
+    return;
   }
 
-  // Compare panel
-  $('cmpAllAcc').textContent=pct(all.accuracy);
-  $('cmpAllRecord').textContent=`${all.wins}W / ${all.losses}L`;
-  $('cmpAllTested').textContent=all.tested;
+  $('oos').textContent=pct(p.rolling_oos_accuracy);
+  $('oosn').textContent=`${p.rolling_oos_predictions??0} strict OOS predictions`;
+  $('cov').textContent=pct(p.rolling_oos_coverage);
+  $('regTop').textContent=String(p.regime||'—').toUpperCase();
+  $('choppy').textContent=`choppy score ${pct(p.choppy_score)}`;
+  $('agreeTop').textContent=p.agreement||'—';
+  $('support').textContent=p.support??'—';
 
-  $('cmpSigAcc').textContent=pct(sigOnly.accuracy);
-  $('cmpSigRecord').textContent=`${sigOnly.wins}W / ${sigOnly.losses}L`;
-  $('cmpSigTested').textContent=sigOnly.tested;
-  $('cmpSigCoverage').textContent=pct(a.coverage);
+  const pred=String(p.prediction||'—').toUpperCase();
+  $('pred').textContent=pred;
+  $('pred').className='signal '+(p.prediction==='big'?'big':'small');
+  $('issue').textContent='V9.3 Flash · strict research signal';
+  $('conf').textContent=pct(p.calibrated_confidence);
+  $('confbar').style.width=`${Math.max(0,Math.min(1,Number(p.calibrated_confidence||0)))*100}%`;
 
-  if(all.accuracy!=null && sigOnly.accuracy!=null){
-    const delta=Number(sigOnly.accuracy)-Number(all.accuracy);
-    $('cmpDelta').textContent=`Accuracy delta: ${delta>=0?'+':''}${(delta*100).toFixed(1)} pp`;
-    $('cmpDelta').className='delta '+(delta>0?'win':delta<0?'loss':'');
-  } else {
-    $('cmpDelta').textContent='Accuracy delta: —';
-    $('cmpDelta').className='delta';
-  }
+  $('sig').textContent=p.signal||'SKIP';
+  $('sig').className='badge '+(p.signal==='PREDICT'?'predict':'skip');
+  $('reg').textContent=`REGIME ${p.regime||'—'}`;
+  $('agree').textContent=`AGREE ${p.agreement||'—'}`;
+  $('threshold').textContent=`THRESHOLD ${pct(p.threshold_used)}`;
+  $('reasons').innerHTML=(p.skip_reasons||[]).map(x=>`<span class="reason">${x}</span>`).join('');
 
-  $('cmpOosAcc').textContent=pct(raw.accuracy);
-  $('cmpOosRecord').textContent=`${raw.samples??0} OOS predictions · ${wf.folds??0} folds`;
-  $('cmpRawBrier').textContent=num(raw.brier);
-  $('cmpCalAcc').textContent=pct(calEval.accuracy);
+  const m=p.components||{};
+  $('models').innerHTML=
+    model('Trend follower',m.trend_follower)+
+    model('Reversionist',m.reversionist)+
+    model('Pattern matcher',m.pattern_matcher);
+  $('pbig').textContent=`Calibrated P(Big): ${pct(p.p_big)}`;
 
-  // Win/Loss record
-  $('recordWins').textContent=all.wins;
-  $('recordLosses').textContent=all.losses;
-  $('recordRate').textContent=pct(all.accuracy);
-  $('signalRate').textContent=pct(sigOnly.accuracy);
+  $('entropy').textContent=pct(p.entropy20);
+  $('tEntropy').textContent=pct(p.transition_entropy);
+  $('switchRate').textContent=pct(p.switch_rate);
+  $('stability').textContent=pct(p.sequence_stability);
 
-  // Latest verified result
-  const recentPreds=d.recent_predictions||[];
-  const latestVerified=recentPreds.find(x=>Number(x.verified)===1);
-  if(latestVerified){
-    const isWin=Number(latestVerified.size_win)===1;
-    $('latestResultIssue').textContent=`Issue ${latestVerified.issue}`;
-    $('latestResult').textContent=isWin?'WIN':'LOSS';
-    $('latestResult').className='latest-result '+(isWin?'win':'loss');
-    $('latestResultInfo').textContent=`Predicted ${String(latestVerified.predicted_size||'—').toUpperCase()} · Actual ${String(latestVerified.actual_size||'—').toUpperCase()} · Confidence ${pct(latestVerified.confidence)}`;
-  }else{
-    $('latestResultIssue').textContent='Issue —';
-    $('latestResult').textContent='PENDING';
-    $('latestResult').className='latest-result pending';
-    $('latestResultInfo').textContent='Waiting for a verified prediction';
-  }
+  const f=p.features||{};
+  $('ema3').textContent=pct(f.ema3);
+  $('ema8').textContent=pct(f.ema8);
+  $('ema20').textContent=pct(f.ema20);
+  $('gapMean').textContent=num(f.gap_to_mean_10,3);
+  $('gaps').textContent=`Gap since Big: ${f.gap_since_big??'—'} · Gap since Small: ${f.gap_since_small??'—'}`;
+}
 
-  $('curve').innerHTML=(wf.confidence_curve||[]).map(r=>`<tr><td>${pct(r.threshold)}</td><td>${pct(r.coverage)}</td><td>${pct(r.accuracy)}</td><td>${r.samples}</td></tr>`).join('')||'<tr><td colspan="4">Not enough OOS history</td></tr>';
-  $('contrib').innerHTML=(p.feature_contributions||[]).map(r=>`<tr><td>${r.feature}</td><td>${r.direction}</td><td>${Number(r.contribution).toFixed(3)}</td></tr>`).join('')||'<tr><td colspan="3">Waiting for model</td></tr>';
-  $('abl').innerHTML=(d.ablation||[]).map(r=>`<tr><td>${r.through_group}</td><td>${r.feature_count}</td><td>${pct(r.accuracy)}</td><td>${num(r.brier)}</td></tr>`).join('')||'<tr><td colspan="4">Not enough history</td></tr>';
-  $('hist').innerHTML=(d.recent_rounds||[]).slice(0,15).map(r=>`<tr><td>${r.issue}</td><td>${r.number}</td><td>${String(r.size).toUpperCase()}</td><td>${String(r.color).toUpperCase()}</td></tr>`).join('');
-  $('preds').innerHTML=recentPreds.slice(0,20).map(x=>{
-    let rr=Number(x.verified)===1?(Number(x.size_win)===1?'WIN':'LOSS'):'PENDING';
-    let cls=rr==='WIN'?'win':rr==='LOSS'?'loss':'pending';
-    return `<tr><td>${x.issue}</td><td>${String(x.predicted_size||'—').toUpperCase()}</td><td>${pct(x.confidence)}</td><td>${x.signal||'—'}</td><td>${x.actual_size||'—'}</td><td class="${cls}"><b>${rr}</b></td></tr>`;
-  }).join('');
+function renderRecent(d){
+  const rows=(d&&d.recent_rounds)||[];
+  $('hist').innerHTML=rows.slice(0,20).map(r=>`<tr><td>${r.issue??'—'}</td><td>${r.number??'—'}</td><td>${String(r.size??'—').toUpperCase()}</td><td>${String(r.color??'—').toUpperCase()}</td></tr>`).join('') || '<tr><td colspan="4">No recent rounds available.</td></tr>';
 }
 
 async function refresh(){
   try{
-    let r=await fetch(`${API}/api/dashboard`,{cache:'no-store'});
-    if(!r.ok)throw Error(`HTTP ${r.status}`);
-    render(await r.json());
+    const [flashRes,dashRes]=await Promise.allSettled([
+      fetch(`${API}/api/v9.3/flash`,{cache:'no-store'}),
+      fetch(`${API}/api/dashboard`,{cache:'no-store'})
+    ]);
+
+    let flash=null,dash=null;
+    if(flashRes.status==='fulfilled' && flashRes.value.ok) flash=await flashRes.value.json();
+    if(dashRes.status==='fulfilled' && dashRes.value.ok) dash=await dashRes.value.json();
+
+    if(!flash) throw Error('V9.3 endpoint unavailable');
+    renderFlash(flash,dash);
+    if(dash) renderRecent(dash);
   }catch(e){
     $('status').textContent='OFFLINE';
     $('status').className='badge err';
     console.error(e);
   }
 }
+
+async function runSimulation(){
+  const btn=$('runSim');
+  const start=Number($('startBalance').value);
+  const target=Number($('targetBalance').value);
+  const stake=Number($('stakePercent').value);
+  const rounds=Number($('maxRounds').value);
+
+  if(!Number.isFinite(start)||start<=0){$('simStatus').textContent='INVALID START BALANCE';return}
+  if(!Number.isFinite(target)||target<start){$('simStatus').textContent='TARGET MUST BE ≥ START';return}
+  if(!Number.isFinite(stake)||stake<0.1||stake>5){$('simStatus').textContent='STAKE MUST BE 0.1–5%';return}
+  if(!Number.isFinite(rounds)||rounds<1||rounds>1000){$('simStatus').textContent='ROUNDS MUST BE 1–1000';return}
+
+  btn.disabled=true;
+  $('simStatus').textContent='SIMULATING…';
+
+  try{
+    const qs=new URLSearchParams({
+      starting_balance:String(start),
+      target_balance:String(target),
+      stake_percent:String(stake),
+      max_rounds:String(Math.floor(rounds))
+    });
+    const r=await fetch(`${API}/api/v9.3/simulate?${qs.toString()}`,{cache:'no-store'});
+    if(!r.ok) throw Error(`HTTP ${r.status}`);
+    const d=await r.json();
+
+    if(!d.ready){
+      $('simStatus').textContent=d.reason||'NOT READY';
+      return;
+    }
+
+    $('simStatus').textContent=d.stop_reason==='target_reached'?'TARGET REACHED':'COMPLETE';
+    $('simEnd').textContent=pkr(d.ending_balance_pkr);
+    $('simMax').textContent=pkr(d.max_balance_reached_pkr);
+    $('simPnl').textContent=(Number(d.profit_loss_pkr)>=0?'+':'')+pkr(d.profit_loss_pkr);
+    $('simPnl').className=Number(d.profit_loss_pkr)>=0?'win':'loss';
+    $('simReturn').textContent=(Number(d.return_percent)>=0?'+':'')+Number(d.return_percent||0).toFixed(2)+'%';
+    $('simReturn').className=Number(d.return_percent)>=0?'win':'loss';
+    $('simRecord').textContent=`${d.wins??0}W / ${d.losses??0}L`;
+    $('simHit').textContent=pct(d.hit_rate);
+    $('simSkips').textContent=d.skips??0;
+    $('simStop').textContent=String(d.stop_reason||'—').replaceAll('_',' ').toUpperCase();
+
+    const rows=d.history||[];
+    $('simRows').innerHTML=rows.map(x=>{
+      if(x.action==='SKIP'){
+        return `<tr><td>${x.issue??'—'}</td><td>SKIP</td><td>${String(x.actual??'—').toUpperCase()}</td><td>—</td><td>PKR 0.00</td><td class="pending">SKIP</td><td>${pkr(x.balance_pkr)}</td></tr>`;
+      }
+      const cls=x.result==='WIN'?'win':'loss';
+      return `<tr><td>${x.issue??'—'}</td><td>${String(x.prediction??'—').toUpperCase()}</td><td>${String(x.actual??'—').toUpperCase()}</td><td>${pct(x.confidence)}</td><td>${pkr(x.virtual_stake_pkr)}</td><td class="${cls}"><b>${x.result??'—'}</b></td><td>${pkr(x.balance_pkr)}</td></tr>`;
+    }).join('') || '<tr><td colspan="7">No simulated predictions.</td></tr>';
+  }catch(e){
+    $('simStatus').textContent='ERROR';
+    console.error(e);
+  }finally{
+    btn.disabled=false;
+  }
+}
+
+$('runSim').addEventListener('click',runSimulation);
 refresh();
 setInterval(refresh,5000);
 </script>

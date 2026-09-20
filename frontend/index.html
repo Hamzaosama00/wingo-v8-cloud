@@ -1,17 +1,318 @@
-<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>WinGo V9 Research</title>
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>WinGo V9 Research</title>
 <style>
-:root{--bg:#05070b;--s:#0b0f16;--s2:#111722;--b:#202938;--t:#f6f8fb;--m:#8490a3;--g:#20df8d;--r:#ff4d64;--bl:#46a6ff;--y:#ffc857}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 20% 0,#101827 0,#05070b 42%);color:var(--t);font-family:Inter,system-ui,Arial}.w{max-width:1280px;margin:auto;padding:22px}.top{display:flex;justify-content:space-between;gap:16px;align-items:center;margin-bottom:18px}h1{margin:0;font-size:24px;letter-spacing:.08em}.muted,.sub{color:var(--m);font-size:12px}.badge{padding:7px 11px;border:1px solid var(--b);border-radius:999px;background:var(--s);font:12px ui-monospace,monospace}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}.card{background:linear-gradient(180deg,var(--s2),var(--s));border:1px solid var(--b);border-radius:16px;padding:16px;box-shadow:0 12px 36px #0005}.label{color:var(--m);font-size:11px;letter-spacing:.11em;text-transform:uppercase}.value{font-size:26px;font-weight:800;margin-top:6px}.two,.cols{display:grid;grid-template-columns:1.3fr .7fr;gap:12px;margin-top:12px}.cols{grid-template-columns:1fr 1fr}.signal{font-size:36px;font-weight:850}.big{color:var(--y)}.small{color:var(--bl)}.predict{color:var(--g)}.skip{color:var(--m)}.bar{height:10px;background:#06090e;border-radius:99px;overflow:hidden;border:1px solid var(--b);margin-top:10px}.bar div{height:100%;background:linear-gradient(90deg,var(--bl),var(--g));width:0}.modelrow{display:grid;grid-template-columns:120px 1fr 55px;gap:10px;align-items:center;margin-top:10px;font-size:12px}.mini{height:7px;background:#06090e;border-radius:99px;overflow:hidden}.mini i{display:block;height:100%;background:var(--bl)}.section{margin-top:12px}.section h2{font-size:14px;letter-spacing:.08em;text-transform:uppercase;margin:0 0 12px}table{width:100%;border-collapse:collapse;font-size:12px}th,td{padding:10px 8px;border-bottom:1px solid var(--b);text-align:left}th{color:var(--m)}.reason{display:inline-block;padding:4px 8px;border:1px solid var(--b);border-radius:99px;color:var(--m);margin:4px 4px 0 0;font-size:11px}.err{color:var(--r)}@media(max-width:850px){.grid{grid-template-columns:1fr 1fr}.two,.cols{grid-template-columns:1fr}.w{padding:12px}}@media(max-width:480px){.grid{grid-template-columns:1fr}.top{flex-direction:column;align-items:flex-start}}
-</style></head><body><div class="w"><div class="top"><div><h1>WINGO V9</h1><div class="muted">Leak-free Big/Small research engine · walk-forward validation</div></div><div class="badge" id="status">CONNECTING</div></div>
-<div class="grid"><div class="card"><div class="label">Stored rounds</div><div class="value" id="stored">—</div><div class="sub">Firestore-backed history</div></div><div class="card"><div class="label">OOS accuracy</div><div class="value" id="oos">—</div><div class="sub" id="oosn">walk-forward</div></div><div class="card"><div class="label">Brier score</div><div class="value" id="brier">—</div><div class="sub">lower is better</div></div><div class="card"><div class="label">Predict coverage</div><div class="value" id="cov">—</div><div class="sub">live verified predictions</div></div></div>
-<div class="two"><div class="card"><div class="label">Next round research output</div><div class="signal skip" id="pred">WAIT</div><div class="sub" id="issue">—</div><div style="margin-top:16px"><div class="label">Calibrated P(Big)</div><div class="value" id="pbig">—</div><div class="bar"><div id="pbar"></div></div></div><div style="margin-top:14px"><span class="badge" id="sig">SKIP</span> <span class="badge" id="reg">—</span> <span class="badge" id="agree">—</span></div><div id="reasons"></div></div><div class="card"><div class="label">Model probabilities</div><div id="models"></div><div class="sub" style="margin-top:14px" id="cal">—</div></div></div>
-<div class="cols"><div class="card section"><h2>Confidence / Coverage Curve</h2><table><thead><tr><th>Threshold</th><th>Coverage</th><th>Accuracy</th><th>N</th></tr></thead><tbody id="curve"></tbody></table></div><div class="card section"><h2>Top Logistic Contributions</h2><table><thead><tr><th>Feature</th><th>Direction</th><th>Contribution</th></tr></thead><tbody id="contrib"></tbody></table></div></div>
-<div class="cols"><div class="card section"><h2>Feature Ablation</h2><table><thead><tr><th>Through Group</th><th>Features</th><th>Accuracy</th><th>Brier</th></tr></thead><tbody id="abl"></tbody></table></div><div class="card section"><h2>Recent Rounds</h2><table><thead><tr><th>Issue</th><th>#</th><th>Size</th><th>Color</th></tr></thead><tbody id="hist"></tbody></table></div></div>
-<div class="card section"><h2>Recent V9 Predictions</h2><table><thead><tr><th>Issue</th><th>Prediction</th><th>Confidence</th><th>Signal</th><th>Actual</th><th>Result</th></tr></thead><tbody id="preds"></tbody></table></div></div>
+:root{
+  --bg:#05070b;--s:#0b0f16;--s2:#111722;--s3:#151d2a;--b:#202938;
+  --t:#f6f8fb;--m:#8490a3;--g:#20df8d;--r:#ff4d64;--bl:#46a6ff;
+  --y:#ffc857;--v:#b77bff;
+}
+*{box-sizing:border-box}
+body{margin:0;background:radial-gradient(circle at 20% 0,#101827 0,#05070b 42%);color:var(--t);font-family:Inter,system-ui,Arial,sans-serif}
+.w{max-width:1320px;margin:auto;padding:22px}
+.top{display:flex;justify-content:space-between;gap:16px;align-items:center;margin-bottom:18px}
+h1{margin:0;font-size:24px;letter-spacing:.08em}
+.muted,.sub{color:var(--m);font-size:12px}
+.badge{display:inline-flex;align-items:center;padding:7px 11px;border:1px solid var(--b);border-radius:999px;background:var(--s);font:12px ui-monospace,monospace}
+.grid{display:grid;grid-template-columns:repeat(6,1fr);gap:12px}
+.card{background:linear-gradient(180deg,var(--s2),var(--s));border:1px solid var(--b);border-radius:16px;padding:16px;box-shadow:0 12px 36px #0005}
+.label{color:var(--m);font-size:11px;letter-spacing:.11em;text-transform:uppercase}
+.value{font-size:26px;font-weight:800;margin-top:6px}
+.two,.cols{display:grid;grid-template-columns:1.3fr .7fr;gap:12px;margin-top:12px}
+.cols{grid-template-columns:1fr 1fr}
+.signal{font-size:36px;font-weight:850}
+.big{color:var(--y)}.small{color:var(--bl)}.predict{color:var(--g)}.skip{color:var(--m)}
+.win{color:var(--g)!important}.loss{color:var(--r)!important}.pending{color:var(--m)!important}
+.bar{height:10px;background:#06090e;border-radius:99px;overflow:hidden;border:1px solid var(--b);margin-top:10px}.bar div{height:100%;background:linear-gradient(90deg,var(--bl),var(--g));width:0}
+.modelrow{display:grid;grid-template-columns:120px 1fr 55px;gap:10px;align-items:center;margin-top:10px;font-size:12px}
+.mini{height:7px;background:#06090e;border-radius:99px;overflow:hidden}.mini i{display:block;height:100%;background:var(--bl)}
+.section{margin-top:12px}.section h2{font-size:14px;letter-spacing:.08em;text-transform:uppercase;margin:0 0 12px}
+table{width:100%;border-collapse:collapse;font-size:12px}th,td{padding:10px 8px;border-bottom:1px solid var(--b);text-align:left}th{color:var(--m)}
+.reason{display:inline-block;padding:4px 8px;border:1px solid var(--b);border-radius:99px;color:var(--m);margin:4px 4px 0 0;font-size:11px}
+.err{color:var(--r)}
+
+.compare-wrap{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
+.compare-box{background:linear-gradient(180deg,var(--s3),#0b1018);border:1px solid var(--b);border-radius:14px;padding:15px}
+.compare-title{font-size:11px;letter-spacing:.1em;color:var(--m);text-transform:uppercase;margin-bottom:9px}
+.compare-acc{font-size:28px;font-weight:850;line-height:1}
+.compare-record{font:12px ui-monospace,monospace;color:var(--m);margin-top:8px}
+.compare-meta{display:grid;grid-template-columns:1fr 1fr;gap:7px;margin-top:12px}
+.compare-meta div{background:#080c12;border:1px solid var(--b);border-radius:9px;padding:8px}
+.compare-meta span{display:block;color:var(--m);font-size:9px;letter-spacing:.08em;text-transform:uppercase}
+.compare-meta b{display:block;margin-top:3px;font-size:13px}
+.delta{font-size:12px;margin-top:9px;color:var(--m)}
+.latest-result{font-size:24px;font-weight:850;margin-top:6px}
+
+@media(max-width:1100px){.grid{grid-template-columns:repeat(3,1fr)}}
+@media(max-width:850px){.grid{grid-template-columns:1fr 1fr}.two,.cols,.compare-wrap{grid-template-columns:1fr}.w{padding:12px}}
+@media(max-width:480px){.grid{grid-template-columns:1fr}.top{flex-direction:column;align-items:flex-start}}
+</style>
+</head>
+<body>
+<div class="w">
+  <div class="top">
+    <div>
+      <h1>WINGO V9.1</h1>
+      <div class="muted">Leak-free Big/Small research engine · walk-forward validation</div>
+    </div>
+    <div class="badge" id="status">CONNECTING</div>
+  </div>
+
+  <!-- Top stats -->
+  <div class="grid">
+    <div class="card"><div class="label">Stored rounds</div><div class="value" id="stored">—</div><div class="sub">Firestore-backed history</div></div>
+    <div class="card"><div class="label">OOS accuracy</div><div class="value" id="oos">—</div><div class="sub" id="oosn">walk-forward</div></div>
+    <div class="card"><div class="label">Brier score</div><div class="value" id="brier">—</div><div class="sub">lower is better</div></div>
+    <div class="card"><div class="label">Predict coverage</div><div class="value" id="cov">—</div><div class="sub">signal-only coverage</div></div>
+    <div class="card"><div class="label">Wins</div><div class="value win" id="wins">—</div><div class="sub" id="winsSub">verified predictions</div></div>
+    <div class="card"><div class="label">Losses</div><div class="value loss" id="losses">—</div><div class="sub" id="lossesSub">verified predictions</div></div>
+  </div>
+
+  <!-- Main prediction -->
+  <div class="two">
+    <div class="card">
+      <div class="label">Next round research output</div>
+      <div class="signal skip" id="pred">WAIT</div>
+      <div class="sub" id="issue">—</div>
+      <div style="margin-top:16px">
+        <div class="label">Calibrated P(Big)</div>
+        <div class="value" id="pbig">—</div>
+        <div class="bar"><div id="pbar"></div></div>
+      </div>
+      <div style="margin-top:14px">
+        <span class="badge" id="sig">SKIP</span>
+        <span class="badge" id="reg">—</span>
+        <span class="badge" id="agree">—</span>
+      </div>
+      <div id="reasons"></div>
+    </div>
+
+    <div class="card">
+      <div class="label">Model probabilities</div>
+      <div id="models"></div>
+      <div class="sub" style="margin-top:14px" id="cal">—</div>
+    </div>
+  </div>
+
+  <!-- Compare panel -->
+  <div class="card section">
+    <h2>Performance Compare Panel</h2>
+    <div class="compare-wrap">
+      <div class="compare-box">
+        <div class="compare-title">All Verified Predictions</div>
+        <div class="compare-acc" id="cmpAllAcc">—</div>
+        <div class="compare-record" id="cmpAllRecord">0W / 0L</div>
+        <div class="compare-meta">
+          <div><span>Tested</span><b id="cmpAllTested">0</b></div>
+          <div><span>Coverage</span><b>100%</b></div>
+        </div>
+      </div>
+
+      <div class="compare-box">
+        <div class="compare-title">PREDICT Signals Only</div>
+        <div class="compare-acc" id="cmpSigAcc">—</div>
+        <div class="compare-record" id="cmpSigRecord">0W / 0L</div>
+        <div class="compare-meta">
+          <div><span>Tested</span><b id="cmpSigTested">0</b></div>
+          <div><span>Coverage</span><b id="cmpSigCoverage">—</b></div>
+        </div>
+        <div class="delta" id="cmpDelta">Accuracy delta: —</div>
+      </div>
+
+      <div class="compare-box">
+        <div class="compare-title">Walk-Forward Validation</div>
+        <div class="compare-acc" id="cmpOosAcc">—</div>
+        <div class="compare-record" id="cmpOosRecord">OOS research set</div>
+        <div class="compare-meta">
+          <div><span>Raw Brier</span><b id="cmpRawBrier">—</b></div>
+          <div><span>Calibrated</span><b id="cmpCalAcc">—</b></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Latest Win/Loss -->
+  <div class="cols">
+    <div class="card section">
+      <h2>Latest Verified Win / Loss</h2>
+      <div class="label" id="latestResultIssue">Issue —</div>
+      <div class="latest-result pending" id="latestResult">PENDING</div>
+      <div class="sub" id="latestResultInfo">Waiting for a verified prediction</div>
+    </div>
+
+    <div class="card section">
+      <h2>Win / Loss Record</h2>
+      <div class="compare-meta">
+        <div><span>Total Wins</span><b class="win" id="recordWins">0</b></div>
+        <div><span>Total Losses</span><b class="loss" id="recordLosses">0</b></div>
+        <div><span>Win Rate</span><b id="recordRate">—</b></div>
+        <div><span>Signal Win Rate</span><b id="signalRate">—</b></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="cols">
+    <div class="card section">
+      <h2>Confidence / Coverage Curve</h2>
+      <table><thead><tr><th>Threshold</th><th>Coverage</th><th>Accuracy</th><th>N</th></tr></thead><tbody id="curve"></tbody></table>
+    </div>
+    <div class="card section">
+      <h2>Top Logistic Contributions</h2>
+      <table><thead><tr><th>Feature</th><th>Direction</th><th>Contribution</th></tr></thead><tbody id="contrib"></tbody></table>
+    </div>
+  </div>
+
+  <div class="cols">
+    <div class="card section">
+      <h2>Feature Ablation</h2>
+      <table><thead><tr><th>Through Group</th><th>Features</th><th>Accuracy</th><th>Brier</th></tr></thead><tbody id="abl"></tbody></table>
+    </div>
+    <div class="card section">
+      <h2>Recent Rounds</h2>
+      <table><thead><tr><th>Issue</th><th>#</th><th>Size</th><th>Color</th></tr></thead><tbody id="hist"></tbody></table>
+    </div>
+  </div>
+
+  <div class="card section">
+    <h2>Recent V9 Predictions</h2>
+    <table>
+      <thead><tr><th>Issue</th><th>Prediction</th><th>Confidence</th><th>Signal</th><th>Actual</th><th>Result</th></tr></thead>
+      <tbody id="preds"></tbody>
+    </table>
+  </div>
+</div>
+
 <script>
-const $=x=>document.getElementById(x),q=new URLSearchParams(location.search);const API=(q.get('api')||localStorage.getItem('wingo_v9_api')||'https://wingo-v8-cloud.onrender.com').replace(/\/$/,'');localStorage.setItem('wingo_v9_api',API);const pct=v=>(v==null?'—':(Number(v)*100).toFixed(1)+'%'),num=(v,d=3)=>(v==null?'—':Number(v).toFixed(d));
-function model(n,p){let x=Math.max(0,Math.min(1,Number(p||0)));return `<div class="modelrow"><span>${n}</span><div class="mini"><i style="width:${x*100}%"></i></div><b>${(x*100).toFixed(1)}%</b></div>`}
-function render(d){$('status').textContent=`V${d.version} · ONLINE`;let st=d.status||{},wf=d.walk_forward||{},raw=wf.raw||{},a=d.accuracy||{},p=d.prediction||{};$('stored').textContent=st.stored_rounds??0;$('oos').textContent=pct(raw.accuracy);$('oosn').textContent=`${raw.samples??0} out-of-sample predictions`;$('brier').textContent=num(raw.brier);$('cov').textContent=pct(a.coverage);
-if(p.ready){$('pred').textContent=String(p.predicted_size||'—').toUpperCase();$('pred').className='signal '+(p.predicted_size==='big'?'big':'small');$('issue').textContent=`Issue ${p.issue}`;$('pbig').textContent=pct(p.p_big_calibrated);$('pbar').style.width=`${Number(p.p_big_calibrated||0)*100}%`;$('sig').textContent=p.signal||'SKIP';$('sig').className='badge '+(p.signal==='PREDICT'?'predict':'skip');$('reg').textContent=`REGIME ${p.regime||'—'}`;$('agree').textContent=`AGREE ${p.agreement||0}/3`;$('reasons').innerHTML=(p.signal_reasons||[]).map(x=>`<span class="reason">${x}</span>`).join('');let m=p.models||{};$('models').innerHTML=model('Logistic',m.logistic)+model('Boosted tree',m.boosted_tree)+model('Markov',m.markov);$('cal').textContent=`Calibration: ${(p.calibration||{}).method||'none'} · OOS ${(p.calibration||{}).oos_samples||0} · threshold ${pct(p.threshold)}`}else{$('pred').textContent='WAIT';$('issue').textContent=p.reason||'insufficient history'}
-$('curve').innerHTML=(wf.confidence_curve||[]).map(r=>`<tr><td>${pct(r.threshold)}</td><td>${pct(r.coverage)}</td><td>${pct(r.accuracy)}</td><td>${r.samples}</td></tr>`).join('')||'<tr><td colspan="4">Not enough OOS history</td></tr>';$('contrib').innerHTML=(p.feature_contributions||[]).map(r=>`<tr><td>${r.feature}</td><td>${r.direction}</td><td>${Number(r.contribution).toFixed(3)}</td></tr>`).join('')||'<tr><td colspan="3">Waiting for model</td></tr>';$('abl').innerHTML=(d.ablation||[]).map(r=>`<tr><td>${r.through_group}</td><td>${r.feature_count}</td><td>${pct(r.accuracy)}</td><td>${num(r.brier)}</td></tr>`).join('')||'<tr><td colspan="4">Not enough history</td></tr>';$('hist').innerHTML=(d.recent_rounds||[]).slice(0,15).map(r=>`<tr><td>${r.issue}</td><td>${r.number}</td><td>${String(r.size).toUpperCase()}</td><td>${String(r.color).toUpperCase()}</td></tr>`).join('');$('preds').innerHTML=(d.recent_predictions||[]).slice(0,20).map(x=>{let rr=Number(x.verified)===1?(Number(x.size_win)===1?'CORRECT':'WRONG'):'PENDING';return `<tr><td>${x.issue}</td><td>${String(x.predicted_size||'—').toUpperCase()}</td><td>${pct(x.confidence)}</td><td>${x.signal||'—'}</td><td>${x.actual_size||'—'}</td><td>${rr}</td></tr>`}).join('')}
-async function refresh(){try{let r=await fetch(`${API}/api/dashboard`,{cache:'no-store'});if(!r.ok)throw Error(`HTTP ${r.status}`);render(await r.json())}catch(e){$('status').textContent='OFFLINE';$('status').className='badge err';console.error(e)}}refresh();setInterval(refresh,5000);
-</script></body></html>
+const $=x=>document.getElementById(x),q=new URLSearchParams(location.search);
+const API=(q.get('api')||localStorage.getItem('wingo_v9_api')||'https://wingo-v8-cloud.onrender.com').replace(/\/$/,'');
+localStorage.setItem('wingo_v9_api',API);
+const pct=v=>(v==null?'—':(Number(v)*100).toFixed(1)+'%');
+const num=(v,d=3)=>(v==null?'—':Number(v).toFixed(d));
+
+function model(n,p){
+  let x=Math.max(0,Math.min(1,Number(p||0)));
+  return `<div class="modelrow"><span>${n}</span><div class="mini"><i style="width:${x*100}%"></i></div><b>${(x*100).toFixed(1)}%</b></div>`;
+}
+
+function record(metric){
+  metric=metric||{};
+  const tested=Number(metric.tested||0);
+  const wins=Number(metric.correct||0);
+  return {tested,wins,losses:Math.max(0,tested-wins),accuracy:metric.accuracy};
+}
+
+function render(d){
+  const refreshState=d.model_refresh||{};
+  $('status').textContent=`V${d.version} · ${refreshState.running?'MODEL REFRESH':'ONLINE'}`;
+  $('status').className='badge';
+
+  let st=d.status||{}, wf=d.walk_forward||{}, raw=wf.raw||{}, calEval=wf.calibrated_eval||{}, a=d.accuracy||{}, p=d.prediction||{};
+  const all=record(a.all_verified);
+  const sigOnly=record(a.predict_only);
+
+  $('stored').textContent=st.stored_rounds??0;
+  $('oos').textContent=pct(raw.accuracy);
+  $('oosn').textContent=`${raw.samples??0} out-of-sample predictions`;
+  $('brier').textContent=num(raw.brier);
+  $('cov').textContent=pct(a.coverage);
+  $('wins').textContent=all.wins;
+  $('losses').textContent=all.losses;
+  $('winsSub').textContent=`${all.tested} verified total`;
+  $('lossesSub').textContent=`${all.tested} verified total`;
+
+  if(p.ready){
+    $('pred').textContent=String(p.predicted_size||'—').toUpperCase();
+    $('pred').className='signal '+(p.predicted_size==='big'?'big':'small');
+    $('issue').textContent=`Issue ${p.issue}`;
+    $('pbig').textContent=pct(p.p_big_calibrated);
+    $('pbar').style.width=`${Number(p.p_big_calibrated||0)*100}%`;
+    $('sig').textContent=p.signal||'SKIP';
+    $('sig').className='badge '+(p.signal==='PREDICT'?'predict':'skip');
+    $('reg').textContent=`REGIME ${p.regime||'—'}`;
+    $('agree').textContent=`AGREE ${p.agreement||0}/3`;
+    $('reasons').innerHTML=(p.signal_reasons||[]).map(x=>`<span class="reason">${x}</span>`).join('');
+    let m=p.models||{};
+    $('models').innerHTML=model('Logistic',m.logistic)+model('Boosted tree',m.boosted_tree)+model('Markov',m.markov);
+    $('cal').textContent=`Calibration: ${(p.calibration||{}).method||'none'} · OOS ${(p.calibration||{}).oos_samples||0} · threshold ${pct(p.threshold)}`;
+  }else{
+    $('pred').textContent='WAIT';
+    $('pred').className='signal skip';
+    $('issue').textContent=p.reason||((d.model_refresh||{}).running?'model refresh in progress':'insufficient history');
+  }
+
+  // Compare panel
+  $('cmpAllAcc').textContent=pct(all.accuracy);
+  $('cmpAllRecord').textContent=`${all.wins}W / ${all.losses}L`;
+  $('cmpAllTested').textContent=all.tested;
+
+  $('cmpSigAcc').textContent=pct(sigOnly.accuracy);
+  $('cmpSigRecord').textContent=`${sigOnly.wins}W / ${sigOnly.losses}L`;
+  $('cmpSigTested').textContent=sigOnly.tested;
+  $('cmpSigCoverage').textContent=pct(a.coverage);
+
+  if(all.accuracy!=null && sigOnly.accuracy!=null){
+    const delta=Number(sigOnly.accuracy)-Number(all.accuracy);
+    $('cmpDelta').textContent=`Accuracy delta: ${delta>=0?'+':''}${(delta*100).toFixed(1)} pp`;
+    $('cmpDelta').className='delta '+(delta>0?'win':delta<0?'loss':'');
+  } else {
+    $('cmpDelta').textContent='Accuracy delta: —';
+    $('cmpDelta').className='delta';
+  }
+
+  $('cmpOosAcc').textContent=pct(raw.accuracy);
+  $('cmpOosRecord').textContent=`${raw.samples??0} OOS predictions · ${wf.folds??0} folds`;
+  $('cmpRawBrier').textContent=num(raw.brier);
+  $('cmpCalAcc').textContent=pct(calEval.accuracy);
+
+  // Win/Loss record
+  $('recordWins').textContent=all.wins;
+  $('recordLosses').textContent=all.losses;
+  $('recordRate').textContent=pct(all.accuracy);
+  $('signalRate').textContent=pct(sigOnly.accuracy);
+
+  // Latest verified result
+  const recentPreds=d.recent_predictions||[];
+  const latestVerified=recentPreds.find(x=>Number(x.verified)===1);
+  if(latestVerified){
+    const isWin=Number(latestVerified.size_win)===1;
+    $('latestResultIssue').textContent=`Issue ${latestVerified.issue}`;
+    $('latestResult').textContent=isWin?'WIN':'LOSS';
+    $('latestResult').className='latest-result '+(isWin?'win':'loss');
+    $('latestResultInfo').textContent=`Predicted ${String(latestVerified.predicted_size||'—').toUpperCase()} · Actual ${String(latestVerified.actual_size||'—').toUpperCase()} · Confidence ${pct(latestVerified.confidence)}`;
+  }else{
+    $('latestResultIssue').textContent='Issue —';
+    $('latestResult').textContent='PENDING';
+    $('latestResult').className='latest-result pending';
+    $('latestResultInfo').textContent='Waiting for a verified prediction';
+  }
+
+  $('curve').innerHTML=(wf.confidence_curve||[]).map(r=>`<tr><td>${pct(r.threshold)}</td><td>${pct(r.coverage)}</td><td>${pct(r.accuracy)}</td><td>${r.samples}</td></tr>`).join('')||'<tr><td colspan="4">Not enough OOS history</td></tr>';
+  $('contrib').innerHTML=(p.feature_contributions||[]).map(r=>`<tr><td>${r.feature}</td><td>${r.direction}</td><td>${Number(r.contribution).toFixed(3)}</td></tr>`).join('')||'<tr><td colspan="3">Waiting for model</td></tr>';
+  $('abl').innerHTML=(d.ablation||[]).map(r=>`<tr><td>${r.through_group}</td><td>${r.feature_count}</td><td>${pct(r.accuracy)}</td><td>${num(r.brier)}</td></tr>`).join('')||'<tr><td colspan="4">Not enough history</td></tr>';
+  $('hist').innerHTML=(d.recent_rounds||[]).slice(0,15).map(r=>`<tr><td>${r.issue}</td><td>${r.number}</td><td>${String(r.size).toUpperCase()}</td><td>${String(r.color).toUpperCase()}</td></tr>`).join('');
+  $('preds').innerHTML=recentPreds.slice(0,20).map(x=>{
+    let rr=Number(x.verified)===1?(Number(x.size_win)===1?'WIN':'LOSS'):'PENDING';
+    let cls=rr==='WIN'?'win':rr==='LOSS'?'loss':'pending';
+    return `<tr><td>${x.issue}</td><td>${String(x.predicted_size||'—').toUpperCase()}</td><td>${pct(x.confidence)}</td><td>${x.signal||'—'}</td><td>${x.actual_size||'—'}</td><td class="${cls}"><b>${rr}</b></td></tr>`;
+  }).join('');
+}
+
+async function refresh(){
+  try{
+    let r=await fetch(`${API}/api/dashboard`,{cache:'no-store'});
+    if(!r.ok)throw Error(`HTTP ${r.status}`);
+    render(await r.json());
+  }catch(e){
+    $('status').textContent='OFFLINE';
+    $('status').className='badge err';
+    console.error(e);
+  }
+}
+refresh();
+setInterval(refresh,5000);
+</script>
+</body>
+</html>

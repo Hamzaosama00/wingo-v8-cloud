@@ -215,6 +215,22 @@ tbody tr.new-row{animation:newRow 0.6s ease}
 .kbd-hint{font-family:var(--mono);font-size:10px;color:var(--muted-2);text-align:center;margin-top:-8px;margin-bottom:18px;letter-spacing:1px}
 .kbd{display:inline-block;padding:1px 6px;background:var(--surface-2);border:1px solid var(--border-2);border-radius:4px;color:var(--text-2);font-size:10px;margin:0 2px}
 
+
+/* Prediction */
+.prediction-card{border-color:var(--border-bright);box-shadow:0 0 28px rgba(255,0,51,0.08)}
+.prediction-grid{display:grid;grid-template-columns:1.4fr repeat(5,1fr);gap:10px}
+.pred-box{background:var(--bg-2);border:1px solid var(--border);border-radius:10px;padding:14px;min-width:0}
+.pred-label{font-family:var(--mono);font-size:9px;letter-spacing:1.5px;color:var(--muted);text-transform:uppercase;margin-bottom:8px}
+.pred-value{font-family:var(--display);font-size:20px;font-weight:700;word-break:break-word}
+.pred-number{font-size:34px;color:var(--red)}
+.pred-meta{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin-top:10px}
+.pred-meta .pred-value{font-family:var(--mono);font-size:13px}
+.signal-skip{color:var(--muted)}
+.signal-medium{color:var(--yellow)}
+.signal-high{color:var(--green)}
+@media (max-width:900px){.prediction-grid{grid-template-columns:repeat(3,1fr)}.pred-meta{grid-template-columns:repeat(3,1fr)}}
+@media (max-width:600px){.prediction-grid{grid-template-columns:repeat(2,1fr)}.pred-meta{grid-template-columns:repeat(2,1fr)}}
+
 /* Responsive */
 @media (max-width:980px){.stats-grid{grid-template-columns:repeat(2,1fr)}.main-grid{grid-template-columns:1fr}.period-card{grid-template-columns:1fr}}
 @media (max-width:600px){.wrap{padding:14px}.brand-name{font-size:24px;letter-spacing:3px}.brand-logo{width:48px;height:48px}.stat-value{font-size:22px}.countdown{font-size:32px}.period-value{font-size:18px}.json-search{width:100%}.topbar{font-size:10px;flex-wrap:wrap;gap:8px}.topbar-right{flex-wrap:wrap}}
@@ -256,13 +272,13 @@ tbody tr.new-row{animation:newRow 0.6s ease}
         <div class="brand-name">WINGO V8</div>
         <div class="brand-sub">CLOUD PREDICTION CONSOLE</div>
       </div>
-      <div class="brand-version">V8.0.1</div>
+      <div class="brand-version">V8.0.4</div>
     </div>
     <div class="tagline">Real-time period analytics · Live data streaming · Cloud sync</div>
   </header>
 
   <div class="kbd-hint">
-    Shortcuts: <span class="kbd">R</span> refresh <span class="kbd">D</span> demo <span class="kbd">S</span> settings <span class="kbd">ESC</span> close
+    Shortcuts: <span class="kbd">R</span> refresh <span class="kbd">S</span> settings <span class="kbd">ESC</span> close
   </div>
 
   <!-- Connection -->
@@ -276,7 +292,6 @@ tbody tr.new-row{animation:newRow 0.6s ease}
     <div class="conn-row">
       <input class="input" id="urlInput" placeholder="https://your-backend-url.com (Optional)" spellcheck="false">
       <button class="btn" id="connectBtn">Connect</button>
-      <button class="btn ghost" id="demoBtn">Demo Mode: ON</button>
     </div>
   </section>
 
@@ -287,9 +302,9 @@ tbody tr.new-row{animation:newRow 0.6s ease}
       <div class="period-value" id="currentPeriod">———</div>
     </div>
     <div class="period-cell">
-      <div class="period-cell-label">Next Draw In</div>
+      <div class="period-cell-label">30s Live Timer</div>
       <div class="countdown" id="countdown">--:--</div>
-      <div class="countdown-label">AUTO REFRESH</div>
+      <div class="countdown-label">SYNCED TO 30-SECOND ROUNDS</div>
     </div>
     <div class="period-cell">
       <div class="period-cell-label">Last Result</div>
@@ -300,6 +315,47 @@ tbody tr.new-row{animation:newRow 0.6s ease}
           <span class="tag big">SIZE —</span>
         </div>
       </div>
+    </div>
+  </section>
+
+  <!-- Next prediction -->
+  <section class="card prediction-card">
+    <div class="card-header">
+      <div class="card-title">Next Prediction</div>
+      <div class="conn-status" id="predictionStatus">WAITING FOR MODEL</div>
+    </div>
+    <div class="prediction-grid">
+      <div class="pred-box">
+        <div class="pred-label">Next Period</div>
+        <div class="pred-value" id="predIssue">———</div>
+      </div>
+      <div class="pred-box">
+        <div class="pred-label">Number</div>
+        <div class="pred-value pred-number" id="predNumber">—</div>
+      </div>
+      <div class="pred-box">
+        <div class="pred-label">Color</div>
+        <div class="pred-value" id="predColor">—</div>
+      </div>
+      <div class="pred-box">
+        <div class="pred-label">Size</div>
+        <div class="pred-value" id="predSize">—</div>
+      </div>
+      <div class="pred-box">
+        <div class="pred-label">Parity</div>
+        <div class="pred-value" id="predParity">—</div>
+      </div>
+      <div class="pred-box">
+        <div class="pred-label">Signal</div>
+        <div class="pred-value signal-skip" id="predSignal">—</div>
+      </div>
+    </div>
+    <div class="pred-meta">
+      <div class="pred-box"><div class="pred-label">Score</div><div class="pred-value" id="predScore">—</div></div>
+      <div class="pred-box"><div class="pred-label">Margin</div><div class="pred-value" id="predMargin">—</div></div>
+      <div class="pred-box"><div class="pred-label">Entropy</div><div class="pred-value" id="predEntropy">—</div></div>
+      <div class="pred-box"><div class="pred-label">Agreement</div><div class="pred-value" id="predAgreement">—</div></div>
+      <div class="pred-box"><div class="pred-label">Regime</div><div class="pred-value" id="predRegime">—</div></div>
     </div>
   </section>
 
@@ -316,12 +372,12 @@ tbody tr.new-row{animation:newRow 0.6s ease}
       <div class="stat-delta flat" id="statWinRateDelta">— 0.0%</div>
     </div>
     <div class="stat">
-      <div class="stat-label">Profit / Loss</div>
+      <div class="stat-label">Model Signal</div>
       <div class="stat-value" id="statPnl">+0.00</div>
       <div class="stat-delta flat" id="statPnlDelta">— 0.00</div>
     </div>
     <div class="stat">
-      <div class="stat-label">Active Sessions</div>
+      <div class="stat-label">Predictions Tested</div>
       <div class="stat-value" id="statSessions">0</div>
       <div class="stat-delta flat" id="statSessionsDelta">— 0</div>
     </div>
@@ -392,7 +448,8 @@ tbody tr.new-row{animation:newRow 0.6s ease}
       <select class="select" id="refreshRate">
         <option value="1000">1s</option>
         <option value="2000">2s</option>
-        <option value="5000" selected>5s</option>
+        <option value="3000" selected>3s</option>
+        <option value="5000">5s</option>
         <option value="10000">10s</option>
       </select>
     </div>
@@ -427,21 +484,21 @@ tbody tr.new-row{animation:newRow 0.6s ease}
 
 <script>
 // ============================================================
-// WinGo V8 Cloud — Live Console (Auto-Start Engine)
+// WinGo V8 Cloud — Live Console
 // ============================================================
 const $ = id => document.getElementById(id);
 const state = {
-  url: localStorage.getItem('wingo_url') || '',
+  url: localStorage.getItem('wingo_url') || 'https://wingo-v8-cloud.onrender.com',
   mode: 'idle',
-  refreshRate: 1000, 
+  refreshRate: 3000, 
   sound: false,
   live: true,
   highlight: true,
   data: null,
   lastPeriod: null,
   history: [],
-  stats: { periods: 1284, winRate: 67.3, pnl: 1245.50, sessions: 142 },
-  prevStats: { periods: 1284, winRate: 67.3, pnl: 1245.50, sessions: 142 }
+  stats: { periods: 0, winRate: 0, pnl: 0, sessions: 0 },
+  prevStats: { periods: 0, winRate: 0, pnl: 0, sessions: 0 }
 };
 
 function toast(msg, type = 'info', ttl = 2800) {
@@ -492,38 +549,6 @@ function tickClock() {
 setInterval(tickClock, 1000);
 tickClock();
 
-let demoPeriod = 20250101000 + Math.floor(Math.random() * 8000);
-function genDemoData() {
-  const number = Math.floor(Math.random() * 10);
-  const color = getColor(number);
-  const size = getSize(number);
-  demoPeriod++;
-  const winChange = Math.random() > 0.45;
-  const newWinRate = Math.min(94, Math.max(45, state.stats.winRate + (winChange ? Math.random() * 2.5 : -Math.random() * 2.5)));
-  const pnlChange = (Math.random() - 0.45) * 80;
-  const newPnl = state.stats.pnl + pnlChange;
-  const newSessions = 80 + Math.floor(Math.random() * 200);
-  return {
-    period: demoPeriod,
-    number, color, size,
-    timestamp: Date.now(),
-    stats: {
-      periods: state.stats.periods + 1,
-      winRate: newWinRate,
-      pnl: newPnl,
-      sessions: newSessions
-    },
-    server: {
-      uptime: 99.97,
-      region: 'us-east-1',
-      latency: 24 + Math.floor(Math.random() * 25),
-      version: '8.0.1',
-      connected: true
-    },
-    meta: { source: 'demo-generator', tz: 'UTC' }
-  };
-}
-
 async function fetchLive() {
   if (!state.url) return null;
   const t0 = performance.now();
@@ -542,33 +567,67 @@ async function fetchLive() {
 }
 
 async function load() {
-  let json;
+  if (!state.url) return null;
   try {
-    if (state.mode === 'demo') {
-      json = genDemoData();
-    } else if (state.url && state.mode !== 'error') {
-      json = await fetchLive();
-    } else {
-      return;
-    }
+    const json = await fetchLive();
     state.data = json;
+    setStatus('live');
     render(json);
+    return json;
   } catch (e) {
-    if (state.mode !== 'error') {
-      setStatus('error');
-      log('error', 'Connection failed: ' + e.message);
-      toast('Connection failed', 'error');
-    }
+    setStatus('error');
+    log('error', 'Connection failed: ' + e.message);
+    toast('Connection failed: ' + e.message, 'error', 3500);
+    throw e;
   }
 }
 
 function render(data) {
   renderJSON(data);
 
-  const period = data.period || data.currentPeriod || data.periodId || (data.lastResult && data.lastResult.period);
-  const number = (data.number !== undefined) ? data.number : (data.lastResult && data.lastResult.number);
-  const color = data.color || (data.lastResult && data.lastResult.color) || (number !== undefined ? getColor(number) : null);
-  const size = data.size || (data.lastResult && data.lastResult.size) || (number !== undefined ? getSize(number) : null);
+  // V8 backend schema
+  const latest = data.latest_round || {};
+  const prediction = data.latest_prediction || null;
+
+  if (latest.issue) {
+    $('currentPeriod').textContent = latest.issue;
+  }
+
+  if (latest.number !== undefined && latest.number !== null) {
+    const lc = latest.color || getColor(Number(latest.number));
+    const ls = latest.size || getSize(Number(latest.number));
+    const orb = $('lastOrb');
+    orb.textContent = latest.number;
+    orb.className = 'result-orb ' + lc;
+    $('lastTags').innerHTML = `<span class="tag ${lc}">${String(lc).toUpperCase()}</span><span class="tag ${ls}">${String(ls).toUpperCase()}</span>`;
+  }
+
+  if (prediction) {
+    $('predIssue').textContent = prediction.issue ?? '—';
+    $('predNumber').textContent = prediction.predicted_number ?? '—';
+    $('predColor').textContent = String(prediction.predicted_color ?? '—').toUpperCase();
+    $('predSize').textContent = String(prediction.predicted_size ?? '—').toUpperCase();
+    $('predParity').textContent = String(prediction.predicted_parity ?? '—').toUpperCase();
+
+    const signal = String(prediction.signal ?? '—').toUpperCase();
+    $('predSignal').textContent = signal;
+    $('predSignal').className = 'pred-value signal-' + signal.toLowerCase();
+
+    const pct = v => (v === null || v === undefined || Number.isNaN(Number(v))) ? '—' : (Number(v) * 100).toFixed(1) + '%';
+    $('predScore').textContent = pct(prediction.joint_score);
+    $('predMargin').textContent = pct(prediction.joint_margin);
+    $('predEntropy').textContent = pct(prediction.joint_entropy);
+    $('predAgreement').textContent = prediction.agreement_count !== undefined ? `${prediction.agreement_count}/3` : '—';
+    $('predRegime').textContent = String(prediction.regime ?? '—').toUpperCase();
+    $('predictionStatus').textContent = prediction.verified ? 'VERIFIED' : 'LIVE · UNVERIFIED';
+  } else {
+    $('predictionStatus').textContent = 'NO PREDICTION YET';
+  }
+
+  const period = data.period || data.currentPeriod || data.periodId || latest.issue || (data.lastResult && data.lastResult.period);
+  const number = (data.number !== undefined) ? data.number : (latest.number !== undefined ? latest.number : (data.lastResult && data.lastResult.number));
+  const color = data.color || latest.color || (data.lastResult && data.lastResult.color) || (number !== undefined ? getColor(number) : null);
+  const size = data.size || latest.size || (data.lastResult && data.lastResult.size) || (number !== undefined ? getSize(number) : null);
 
   if (period) $('currentPeriod').textContent = period;
 
@@ -579,13 +638,28 @@ function render(data) {
     $('lastTags').innerHTML = `<span class="tag ${color}">${color.toUpperCase()}</span><span class="tag ${size}">${size.toUpperCase()}</span>`;
   }
 
+  if (Array.isArray(data.history) && data.history.length) {
+    state.history = data.history.slice(0, 50).map(r => ({
+      period: r.issue ?? r.period,
+      number: r.number,
+      color: r.color || getColor(Number(r.number)),
+      size: r.size || getSize(Number(r.number)),
+      time: r.seen_at ? new Date(Number(r.seen_at) * 1000).toLocaleTimeString('en-US', {hour12:false}) : '—'
+    }));
+    renderHistory(false);
+    renderDistribution();
+  }
+
   const stats = data.stats || data.statistics || {};
+
   state.prevStats = { ...state.stats };
+  const tested = data.accuracy?.joint?.tested ?? 0;
+  const jointAccuracy = data.accuracy?.joint?.accuracy;
   state.stats = {
-    periods: stats.periods ?? stats.totalPeriods ?? state.stats.periods,
-    winRate: stats.winRate ?? stats.win_rate ?? state.stats.winRate,
-    pnl: stats.pnl ?? stats.profitLoss ?? stats.profit ?? state.stats.pnl,
-    sessions: stats.sessions ?? stats.activeSessions ?? state.stats.sessions
+    periods: data.status?.stored_rounds ?? stats.periods ?? stats.totalPeriods ?? state.stats.periods,
+    winRate: jointAccuracy !== undefined ? Number(jointAccuracy) * 100 : (stats.winRate ?? stats.win_rate ?? state.stats.winRate),
+    pnl: stats.pnl ?? stats.profitLoss ?? stats.profit ?? 0,
+    sessions: tested
   };
   updateStat('statPeriods', state.stats.periods, state.prevStats.periods, fmtNum);
   updateStat('statWinRate', state.stats.winRate, state.prevStats.winRate, v => v.toFixed(1) + '%', v => v.toFixed(1) + '%');
@@ -593,9 +667,11 @@ function render(data) {
   updateStat('statSessions', state.stats.sessions, state.prevStats.sessions, fmtNum);
 
   const pnlEl = $('statPnl');
-  pnlEl.className = 'stat-value ' + (state.stats.pnl > 0 ? 'profit' : state.stats.pnl < 0 ? 'loss' : '');
+  pnlEl.textContent = String(data.latest_prediction?.signal ?? '—').toUpperCase();
+  pnlEl.className = 'stat-value';
+  $('statPnlDelta').textContent = data.latest_prediction ? 'MODEL OUTPUT' : '—';
 
-  if (state.live && period && period !== state.lastPeriod) {
+  if (!Array.isArray(data.history) && state.live && period && period !== state.lastPeriod) {
     state.lastPeriod = period;
     const isNew = state.history.length > 0;
     state.history.unshift({
@@ -687,20 +763,24 @@ function renderJSON(data, filter = '') {
   }
 }
 
-let countdownSec = 60;
-setInterval(() => {
-  if (state.mode === 'idle' || state.mode === 'error') return;
-  countdownSec--;
-  if (countdownSec <= 0) {
-    countdownSec = 60;
-    if (state.mode === 'demo') load();
-  }
-  const m = String(Math.floor(countdownSec / 60)).padStart(2, '0');
-  const s = String(countdownSec % 60).padStart(2, '0');
+function updateLive30sTimer() {
+  const now = Date.now();
+  const elapsedInRound = Math.floor((now / 1000) % 30);
+  let remaining = 30 - elapsedInRound;
+  if (remaining <= 0 || remaining > 30) remaining = 30;
+
   const el = $('countdown');
-  el.textContent = m + ':' + s;
-  el.className = 'countdown' + (countdownSec <= 10 ? ' warn' : '');
-}, 1000);
+  el.textContent = '00:' + String(remaining).padStart(2, '0');
+  el.className = 'countdown' + (remaining <= 5 ? ' warn' : '');
+
+  // Refresh once as a new 30-second window begins.
+  if (remaining === 30 && state.mode === 'live') {
+    load().catch(() => {});
+  }
+}
+
+setInterval(updateLive30sTimer, 250);
+updateLive30sTimer();
 
 let audioCtx;
 function beep() {
@@ -719,56 +799,45 @@ function beep() {
   } catch (e) {}
 }
 
-// ---------- EVENT LISTENERS (Direct Binding) ----------
- $('connectBtn').addEventListener('click', () => {
+// ---------- EVENT LISTENERS ----------
+$('connectBtn').addEventListener('click', async () => {
   const v = $('urlInput').value.trim().replace(/\/$/, '');
-  if (!v) { 
-    toast('No URL! Starting Demo Mode instead.', 'warn'); 
-    $('demoBtn').click(); 
-    return; 
-  }
-  state.url = v;
-  localStorage.setItem('wingo_url', v);
-  setStatus('live');
-  log('info', 'Connecting to ' + v);
-  toast('Connecting to backend...', 'info', 1500);
-  load();
-});
-
- $('demoBtn').addEventListener('click', () => {
-  if (state.mode === 'demo') {
-    setStatus('idle');
-    toast('Demo mode disabled', 'info');
-    log('info', 'Demo mode disabled');
-    $('demoBtn').textContent = 'Demo Mode: OFF';
+  if (!v) {
+    toast('Enter the backend URL', 'warn');
     return;
   }
-  setStatus('demo');
-  $('demoBtn').textContent = 'Demo Mode: ON';
-  log('info', 'Demo mode enabled - generating synthetic data');
-  toast('Demo mode active!', 'success');
-  if (state.history.length === 0) {
-    for (let i = 8; i >= 1; i--) {
-      const n = Math.floor(Math.random() * 10);
-      state.history.push({
-        period: demoPeriod - i,
-        number: n, color: getColor(n), size: getSize(n),
-        time: new Date(Date.now() - i * 60000).toLocaleTimeString('en-US', { hour12: false })
-      });
-    }
-    renderHistory(false);
-    renderDistribution();
+
+  state.url = v;
+  localStorage.setItem('wingo_url', v);
+  setStatus('idle');
+  log('info', 'Connecting to ' + v);
+
+  const btn = $('connectBtn');
+  btn.disabled = true;
+  btn.textContent = 'CONNECTING...';
+
+  try {
+    await load();
+    log('success', 'Backend connected');
+    toast('Backend connected', 'success');
+  } catch (e) {
+    // Detailed error is shown by load().
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'CONNECT';
   }
-  load();
 });
 
- $('refreshBtn').addEventListener('click', () => {
+$('refreshBtn').addEventListener('click', () => {
+  if (!state.url) {
+    toast('Connect backend first', 'warn');
+    return;
+  }
   log('info', 'Manual refresh triggered');
-  if (state.mode === 'idle') { toast('Starting Demo Mode...', 'info'); $('demoBtn').click(); return; }
-  load();
+  load().catch(() => {});
 });
 
- $('settingsBtn').addEventListener('click', () => $('settingsModal').classList.add('open'));
+$('settingsBtn').addEventListener('click', () => $('settingsModal').classList.add('open'));
  $('closeSettings').addEventListener('click', () => $('settingsModal').classList.remove('open'));
  $('settingsModal').addEventListener('click', e => { if (e.target.id === 'settingsModal') $('settingsModal').classList.remove('open'); });
 
@@ -820,27 +889,30 @@ let pollTimer;
 function restartPolling() {
   if (pollTimer) clearInterval(pollTimer);
   pollTimer = setInterval(() => {
-    if (state.mode === 'live' || state.mode === 'demo') load();
+    if (state.mode === 'live') load().catch(() => {});
   }, state.refreshRate);
 }
 restartPolling();
 
-// ---------- AUTO-BOOT DEMO MODE ----------
-log('info', 'System initialized - v8.0.1');
-log('info', 'Auto-starting Demo Mode engine...');
+// ---------- AUTO-BOOT LIVE BACKEND ----------
+log('info', 'System initialized - v8.0.4');
+$('urlInput').value = state.url;
 
-// Start Demo Mode Automatically after 800ms
-setTimeout(() => {
-  const demoBtn = $('demoBtn');
-  if (demoBtn) demoBtn.click();
-}, 800);
+if (state.url) {
+  log('info', 'Connecting to saved backend...');
+  load()
+    .then(() => {
+      log('success', 'Backend connected');
+      toast('Backend connected', 'success');
+    })
+    .catch(() => {});
+}
 
 // Keyboard shortcuts
 document.addEventListener('keydown', e => {
   if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
   const k = e.key.toLowerCase();
   if (k === 'r') { e.preventDefault(); $('refreshBtn').click(); }
-  else if (k === 'd') { e.preventDefault(); $('demoBtn').click(); }
   else if (k === 's') { e.preventDefault(); $('settingsBtn').click(); }
   else if (e.key === 'Escape') $('settingsModal').classList.remove('open');
 });

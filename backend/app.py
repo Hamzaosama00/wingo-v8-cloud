@@ -1,729 +1,1667 @@
-from __future__ import annotations
+import math
+import os
+import sqlite3
+import threading
+import time
+from collections import defaultdict
+from contextlib import asynccontextmanager
+from typing import Any, Dict, Hashable, List, Optional, Sequence, Tuple
 
-import json, math, os, sqlite3, threading, time
-
-# Keep BLAS / sklearn from spawning many threads on small Render instances.
-os.environ.setdefault("OMP_NUM_THREADS", "1")
-os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
-os.environ.setdefault("MKL_NUM_THREADS", "1")
-os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
-
-import numpy as np
-import psutil
 import requests
+import numpy as np
+from sklearn.isotonic import IsotonicRegression
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from sklearn.ensemble import HistGradientBoostingClassifier
-from sklearn.isotonic import IsotonicRegression
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score, brier_score_loss, log_loss
-from sklearn.preprocessing import StandardScaler
-
-try:
-    from google.oauth2 import service_account
-    from google.auth.transport.requests import Request as GoogleAuthRequest
-except Exception:
-    service_account = None
-    GoogleAuthRequest = None
-
-APP_VERSION = "9.1.0"
-MODEL_VERSION = "v9.1-nonblocking"
-DB_PATH = os.getenv("DB_PATH", "wingo_v9.db")
-INGEST_SECRET = os.getenv("INGEST_SECRET", "")
-FIREBASE_PROJECT_ID = os.getenv("FIREBASE_PROJECT_ID", "").strip()
-GOOGLE_APPLICATION_CREDENTIALS = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
-HISTORY_LIMIT = max(300, int(os.getenv("HISTORY_LIMIT", "600")))
-LIVE_TRAIN_LIMIT = max(150, int(os.getenv("V9_LIVE_TRAIN_LIMIT", "350")))
-FULL_EVAL_EVERY = max(5, int(os.getenv("V9_FULL_EVAL_EVERY", "25")))
-MIN_TRAIN = max(60, int(os.getenv("V9_MIN_TRAIN", "100")))
-BACKTEST_BLOCK = max(20, int(os.getenv("V9_BACKTEST_BLOCK", "50")))
-EMBARGO = max(0, int(os.getenv("V9_EMBARGO", "20")))
-SIGNAL_THRESHOLD = float(os.getenv("V9_SIGNAL_THRESHOLD", "0.60"))
-CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*")
-CORS_LIST = ["*"] if CORS_ORIGINS.strip() == "*" else [x.strip() for x in CORS_ORIGINS.split(",") if x.strip()]
-
-DB_LOCK = threading.RLock()
-MODEL_LOCK = threading.RLock()
-_FIRESTORE = None
-_FIRESTORE_LOCK = threading.Lock()
-MODEL_CACHE: Dict[str, Any] = {"history_issue": None, "prediction": None, "report": None, "ablation": None, "calibrator": None}
-TRAIN_LOCK = threading.Lock()
-TRAIN_STATE: Dict[str, Any] = {"running": False, "pending": False, "pending_full": False, "last_started": None, "last_finished": None, "last_error": None, "last_mode": None}
 
 
-def size_from_number(n: int) -> str: return "big" if int(n) >= 5 else "small"
-def parity_from_number(n: int) -> str: return "even" if int(n) % 2 == 0 else "odd"
-def normalize_color(c: str) -> str:
-    c = (c or "").lower()
-    if "violet" in c: return "violet"
-    if "red" in c: return "red"
-    if "green" in c: return "green"
-    return c.strip() or "unknown"
-def increment_issue(issue: str) -> str:
-    try: return str(int(issue) + 1)
-    except Exception: return issue + "_next"
-def clip_prob(p: float) -> float: return float(min(1-1e-6, max(1e-6, p)))
-def entropy_binary(p: float) -> float:
-    p = clip_prob(p)
-    return float(-(p*math.log2(p) + (1-p)*math.log2(1-p)))
+HISTORY_URL = os.getenv(
+    "WINGO_HISTORY_URL",
+    "https://draw.ar-lottery01.com/WinGo/WinGo_30S/GetHistoryIssuePage.json",
+)
+
+ORIGIN_HEADER = os.getenv("WINGO_ORIGIN", "https://www.92pak8.com")
+REFERER_HEADER = os.getenv("WINGO_REFERER", "https://www.92pak8.com/")
+DB_PATH = os.getenv("DB_PATH", "wingo_master.db")
+
+HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "500"))
+BACKFILL_TARGET = int(os.getenv("BACKFILL_TARGET", "500"))
+BACKFILL_PAGE_SIZE = int(os.getenv("BACKFILL_PAGE_SIZE", "100"))
+POLL_SECONDS = float(os.getenv("POLL_SECONDS", "3"))
+MIN_HISTORY = int(os.getenv("MIN_HISTORY", "50"))
+NUMBER_STATES = list(range(10))
+
+COLOR_STATES = ["red", "green", "violet"]
+SIZE_STATES = ["small", "big"]
+PARITY_STATES = ["even", "odd"]
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/153.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
+    "Origin": ORIGIN_HEADER,
+    "Referer": REFERER_HEADER,
+}
 
 
-def db_conn():
-    c = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30)
-    c.row_factory = sqlite3.Row
-    return c
+class PredictorEngine:
+    def __init__(self) -> None:
+        self.session = requests.Session()
+        self.session.headers.update(HEADERS)
+        self.stop_event = threading.Event()
+        self.worker: Optional[threading.Thread] = None
+        self.lock = threading.RLock()
 
+        self.last_error: Optional[str] = None
+        self.last_poll_at: Optional[int] = None
+        self.last_api_ok_at: Optional[int] = None
+        self.last_seen_issue: Optional[str] = None
 
-def init_db():
-    with DB_LOCK, db_conn() as c:
-        c.execute("""CREATE TABLE IF NOT EXISTS v9_rounds(
-            issue TEXT PRIMARY KEY, number INTEGER NOT NULL, color TEXT NOT NULL,
-            size TEXT NOT NULL, parity TEXT NOT NULL, seen_at REAL NOT NULL)""")
-        c.execute("""CREATE TABLE IF NOT EXISTS v9_predictions(
-            issue TEXT PRIMARY KEY, created_at REAL NOT NULL, model_version TEXT NOT NULL,
-            predicted_size TEXT NOT NULL, p_big_raw REAL NOT NULL, p_big_calibrated REAL NOT NULL,
-            confidence REAL NOT NULL, signal TEXT NOT NULL, regime TEXT NOT NULL,
-            threshold REAL NOT NULL, verified INTEGER NOT NULL DEFAULT 0,
-            actual_size TEXT, size_win INTEGER, details_json TEXT)""")
-        c.commit()
+        self.ema_decay = float(os.getenv("EMA_DECAY", "0.82"))
+        self._setup_db()
 
+    # ---------------------------------------------------------
+    # Database helpers
+    # ---------------------------------------------------------
 
-def round_count() -> int:
-    with DB_LOCK, db_conn() as c: return int(c.execute("SELECT COUNT(*) c FROM v9_rounds").fetchone()["c"])
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(DB_PATH, timeout=30)
+        conn.row_factory = sqlite3.Row
+        return conn
 
+    def _setup_db(self) -> None:
+        db_parent = os.path.dirname(os.path.abspath(DB_PATH))
+        os.makedirs(db_parent, exist_ok=True)
 
-def save_round_local(issue, number, color, seen_at=None):
-    with DB_LOCK, db_conn() as c:
-        cur = c.execute("INSERT OR IGNORE INTO v9_rounds VALUES(?,?,?,?,?,?)",
-            (str(issue), int(number), normalize_color(color), size_from_number(number), parity_from_number(number), float(seen_at or time.time())))
-        c.commit(); return cur.rowcount > 0
+        with self._connect() as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS rounds (
+                    issue TEXT PRIMARY KEY,
+                    number INTEGER NOT NULL,
+                    color TEXT NOT NULL,
+                    size TEXT NOT NULL,
+                    parity TEXT NOT NULL,
+                    seen_at INTEGER NOT NULL
+                )
+            """)
 
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS predictions (
+                    issue TEXT PRIMARY KEY,
+                    based_on_issue TEXT NOT NULL,
 
-def load_rounds(limit=HISTORY_LIMIT):
-    with DB_LOCK, db_conn() as c:
-        rows = c.execute("SELECT * FROM v9_rounds ORDER BY CAST(issue AS INTEGER) DESC LIMIT ?", (int(limit),)).fetchall()
-    out = [dict(r) for r in rows]; out.reverse(); return out
+                    joint_state TEXT NOT NULL,
+                    predicted_color TEXT NOT NULL,
+                    predicted_size TEXT NOT NULL,
+                    predicted_parity TEXT NOT NULL,
 
+                    joint_score REAL NOT NULL,
+                    joint_margin REAL NOT NULL,
+                    joint_entropy REAL NOT NULL,
+                    joint_support INTEGER NOT NULL,
+                    agreement_count INTEGER NOT NULL,
+                    regime TEXT NOT NULL,
+                    volatility REAL NOT NULL,
+                    signal TEXT NOT NULL,
 
-def save_prediction_local(p):
-    details = dict(p)
-    with DB_LOCK, db_conn() as c:
-        c.execute("""INSERT OR REPLACE INTO v9_predictions
-        (issue,created_at,model_version,predicted_size,p_big_raw,p_big_calibrated,confidence,signal,regime,threshold,verified,actual_size,size_win,details_json)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-        (p["issue"], float(p.get("created_at", time.time())), p.get("model_version", MODEL_VERSION), p["predicted_size"],
-         float(p["p_big_raw"]), float(p["p_big_calibrated"]), float(p["confidence"]), p["signal"], p["regime"], float(p["threshold"]),
-         int(p.get("verified",0)), p.get("actual_size"), p.get("size_win"), json.dumps(details,separators=(",",":"))))
-        c.commit()
+                    color_score REAL NOT NULL,
+                    size_score REAL NOT NULL,
+                    parity_score REAL NOT NULL,
 
+                    created_at INTEGER NOT NULL,
+                    verified INTEGER NOT NULL DEFAULT 0,
 
-def verify_prediction(issue, actual_size):
-    with DB_LOCK, db_conn() as c:
-        r = c.execute("SELECT * FROM v9_predictions WHERE issue=?", (str(issue),)).fetchone()
-        if not r: return None
-        win = 1 if r["predicted_size"] == actual_size else 0
-        c.execute("UPDATE v9_predictions SET verified=1,actual_size=?,size_win=? WHERE issue=?", (actual_size,win,str(issue))); c.commit()
-        d = dict(r); d.update({"verified":1,"actual_size":actual_size,"size_win":win}); return d
+                    actual_color TEXT,
+                    actual_size TEXT,
+                    actual_parity TEXT,
+                    joint_win INTEGER,
+                    color_win INTEGER,
+                    size_win INTEGER,
+                    parity_win INTEGER
+                )
+            """)
 
+            # V7 migration: keep the predicted digit as well as derived features.
+            columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(predictions)").fetchall()
+            }
+            if "predicted_number" not in columns:
+                conn.execute("ALTER TABLE predictions ADD COLUMN predicted_number INTEGER")
 
-def load_predictions(limit=120):
-    with DB_LOCK, db_conn() as c:
-        rows = c.execute("SELECT * FROM v9_predictions ORDER BY CAST(issue AS INTEGER) DESC LIMIT ?", (int(limit),)).fetchall()
-    out=[]
-    for r in rows:
-        d=dict(r)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_rounds_seen_at
+                ON rounds(seen_at)
+            """)
+
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_predictions_created
+                ON predictions(created_at)
+            """)
+
+            conn.commit()
+
+    def save_round(self, game: Dict[str, Any]) -> bool:
+        with self._connect() as conn:
+            cur = conn.execute("""
+                INSERT OR IGNORE INTO rounds
+                (issue, number, color, size, parity, seen_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (
+                game["issue"],
+                game["number"],
+                game["color"],
+                game["size"],
+                game["parity"],
+                int(time.time()),
+            ))
+            conn.commit()
+            return cur.rowcount > 0
+
+    def count_rounds(self) -> int:
+        with self._connect() as conn:
+            row = conn.execute("SELECT COUNT(*) AS c FROM rounds").fetchone()
+            return int(row["c"])
+
+    def load_history(self, limit: int = HISTORY_LIMIT) -> List[Dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute("""
+                SELECT issue, number, color, size, parity, seen_at
+                FROM rounds
+                ORDER BY
+                    CASE
+                        WHEN issue GLOB '[0-9]*' THEN CAST(issue AS INTEGER)
+                        ELSE seen_at
+                    END DESC
+                LIMIT ?
+            """, (limit,)).fetchall()
+
+        rows = list(reversed(rows))
+        return [dict(row) for row in rows]
+
+    def prediction_exists(self, issue: str) -> bool:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM predictions WHERE issue = ?",
+                (issue,),
+            ).fetchone()
+        return row is not None
+
+    # ---------------------------------------------------------
+    # API and parsing
+    # ---------------------------------------------------------
+
+    def fetch_history(self, page_no: int = 1, page_size: int = 100) -> Optional[Dict[str, Any]]:
         try:
-            j=json.loads(d.pop("details_json") or "{}"); j.update(d); d=j
-        except Exception: pass
-        out.append(d)
-    return out
+            response = self.session.get(
+                HISTORY_URL,
+                params={
+                    "pageNo": page_no,
+                    "pageSize": page_size,
+                    "ts": int(time.time() * 1000),
+                },
+                timeout=10,
+            )
+            response.raise_for_status()
+            data = response.json()
 
+            self.last_api_ok_at = int(time.time())
+            self.last_error = None
+            return data
 
-def fs_enc(v):
-    if v is None: return {"nullValue":None}
-    if isinstance(v,bool): return {"booleanValue":v}
-    if isinstance(v,int) and not isinstance(v,bool): return {"integerValue":str(v)}
-    if isinstance(v,float): return {"doubleValue":float(v)} if math.isfinite(v) else {"nullValue":None}
-    if isinstance(v,str): return {"stringValue":v}
-    if isinstance(v,list): return {"arrayValue":{"values":[fs_enc(x) for x in v]}}
-    if isinstance(v,dict): return {"mapValue":{"fields":{k:fs_enc(x) for k,x in v.items()}}}
-    return {"stringValue":str(v)}
+        except Exception as exc:
+            self.last_error = f"{type(exc).__name__}: {exc}"
+            return None
 
+    @staticmethod
+    def parse_color(raw: Any) -> Optional[str]:
+        parts = [x.strip().lower() for x in str(raw).split(",") if x.strip()]
 
-def fs_dec(o):
-    if "nullValue" in o: return None
-    if "booleanValue" in o: return bool(o["booleanValue"])
-    if "integerValue" in o:
-        try: return int(o["integerValue"])
-        except Exception: return 0
-    if "doubleValue" in o: return float(o["doubleValue"])
-    if "stringValue" in o: return str(o["stringValue"])
-    if "arrayValue" in o: return [fs_dec(x) for x in o.get("arrayValue",{}).get("values",[])]
-    if "mapValue" in o: return {k:fs_dec(v) for k,v in o.get("mapValue",{}).get("fields",{}).items()}
-    return None
+        if "violet" in parts:
+            return "violet"
+        if "red" in parts:
+            return "red"
+        if "green" in parts:
+            return "green"
+        return None
 
+    def parse_api_history(self, data: Dict[str, Any]) -> List[Dict[str, Any]]:
+        try:
+            items = data["data"]["list"]
+        except (KeyError, TypeError):
+            return []
 
-class FirestoreREST:
-    def __init__(self, project_id, cred_path):
-        if service_account is None: raise RuntimeError("google-auth missing")
-        self.base=f"https://firestore.googleapis.com/v1/projects/{project_id}/databases/(default)/documents"
-        self.creds=service_account.Credentials.from_service_account_file(cred_path, scopes=["https://www.googleapis.com/auth/datastore","https://www.googleapis.com/auth/cloud-platform"])
-        self.req=GoogleAuthRequest(); self.s=requests.Session(); self.lock=threading.Lock()
-    def headers(self):
-        with self.lock:
-            if not self.creds.valid: self.creds.refresh(self.req)
-            tok=self.creds.token
-        return {"Authorization":f"Bearer {tok}","Content-Type":"application/json"}
-    def set_doc(self,col,doc_id,data):
-        body={"fields":{k:fs_enc(v) for k,v in data.items()}}
-        r=self.s.patch(f"{self.base}/{col}/{doc_id}",headers=self.headers(),json=body,timeout=15); r.raise_for_status()
-    def list_docs(self,col,limit=1000):
-        out=[]; token=None
-        while len(out)<limit:
-            params={"pageSize":min(1000,limit-len(out)),"orderBy":"__name__ desc"}
-            if token: params["pageToken"]=token
-            r=self.s.get(f"{self.base}/{col}",headers=self.headers(),params=params,timeout=20)
-            if r.status_code==404: break
-            r.raise_for_status(); p=r.json()
-            for doc in p.get("documents",[]):
-                d={k:fs_dec(v) for k,v in doc.get("fields",{}).items()}; d["_id"]=doc.get("name","").rsplit("/",1)[-1]; out.append(d)
-            token=p.get("nextPageToken")
-            if not token: break
-        return out
+        parsed: List[Dict[str, Any]] = []
 
+        for item in items:
+            try:
+                issue = str(item["issueNumber"])
+                number = int(item["number"])
+                color = self.parse_color(item.get("color", ""))
 
-def get_firestore():
-    global _FIRESTORE
-    if not FIREBASE_PROJECT_ID or not GOOGLE_APPLICATION_CREDENTIALS: return None
-    if _FIRESTORE is None:
-        with _FIRESTORE_LOCK:
-            if _FIRESTORE is None: _FIRESTORE=FirestoreREST(FIREBASE_PROJECT_ID,GOOGLE_APPLICATION_CREDENTIALS)
-    return _FIRESTORE
+                if color is None:
+                    continue
 
+                parsed.append({
+                    "issue": issue,
+                    "number": number,
+                    "color": color,
+                    "size": "big" if number >= 5 else "small",
+                    "parity": "even" if number % 2 == 0 else "odd",
+                })
 
-def cloud_save_round(r):
-    fs=get_firestore()
-    if not fs: return None
-    try:
-        fs.set_doc("rounds",str(r["issue"]),{"issue":str(r["issue"]),"number":int(r["number"]),"color":normalize_color(r["color"]),"size":size_from_number(int(r["number"])),"parity":parity_from_number(int(r["number"])),"seen_at":float(r.get("seen_at",time.time()))}); return None
-    except Exception as e: return str(e)
+            except (KeyError, TypeError, ValueError):
+                continue
 
+        # API commonly returns newest -> oldest.
+        parsed.reverse()
+        return parsed
 
-def cloud_save_prediction(p):
-    fs=get_firestore()
-    if not fs: return None
-    try:
-        fs.set_doc("v9_predictions",str(p["issue"]),{k:p.get(k) for k in ["issue","created_at","model_version","predicted_size","p_big_raw","p_big_calibrated","confidence","signal","regime","threshold","verified","actual_size","size_win"]}); return None
-    except Exception as e: return str(e)
+    # ---------------------------------------------------------
+    # Generic statistical models
+    # ---------------------------------------------------------
 
+    @staticmethod
+    def normalize(scores: Dict[Hashable, float], states: Sequence[Hashable]) -> Dict[Hashable, float]:
+        total = sum(max(float(scores.get(state, 0.0)), 0.0) for state in states)
 
-def hydrate_from_firestore():
-    fs=get_firestore()
-    if not fs: return 0,0,None
-    rr=rp=0
-    try:
-        docs=fs.list_docs("rounds",HISTORY_LIMIT); docs.reverse()
-        for d in docs:
-            issue=str(d.get("issue") or d.get("_id") or ""); n=d.get("number"); color=d.get("color")
-            if issue and n is not None and color is not None:
-                if save_round_local(issue,int(n),str(color),float(d.get("seen_at") or time.time())): rr+=1
-        preds=fs.list_docs("v9_predictions",600); preds.reverse()
-        for p in preds:
-            issue=str(p.get("issue") or p.get("_id") or "")
-            if issue and p.get("predicted_size"):
-                save_prediction_local({"issue":issue,"created_at":float(p.get("created_at") or time.time()),"model_version":p.get("model_version",MODEL_VERSION),"predicted_size":p["predicted_size"],"p_big_raw":float(p.get("p_big_raw") or .5),"p_big_calibrated":float(p.get("p_big_calibrated") or .5),"confidence":float(p.get("confidence") or .5),"signal":p.get("signal","SKIP"),"regime":p.get("regime","UNKNOWN"),"threshold":float(p.get("threshold") or SIGNAL_THRESHOLD),"verified":int(p.get("verified") or 0),"actual_size":p.get("actual_size"),"size_win":p.get("size_win")}); rp+=1
-        return rr,rp,None
-    except Exception as e: return rr,rp,str(e)
+        if total <= 0:
+            uniform = 1.0 / len(states)
+            return {state: uniform for state in states}
 
-
-FEATURE_GROUPS={
-"base":["last_is_big","last_number_norm","last_even"],
-"streak":["current_streak","run1","run2","run3","run_mean_200","run_std_200","run_max_200"],
-"multiscale":["big_ratio_20","big_ratio_50","big_ratio_100","big_ratio_300","dev_20_100","dev_20_300","dev_100_300"],
-"transition":["p_big_after_big_100","p_big_after_small_100","p_big_after_big_300","p_big_after_small_300"],
-"number":["num_mean_20","num_std_20","num_mean_100","num_std_100","sum_last5_norm","last_distance_45","even_ratio_20","mod3_0_50","mod3_1_50","mod3_2_50"],
-"regime":["change_rate_20","change_rate_100","entropy_20","entropy_100","short_long_shift"],
-"issue_experimental":["issue_mod_2","issue_mod_3","issue_mod_5","issue_mod_7","issue_mod_11"]}
-FEATURE_NAMES=[n for g in FEATURE_GROUPS.values() for n in g]
-
-
-def big_values(h): return [1 if r["size"]=="big" else 0 for r in h]
-def ratio_last(v,w):
-    if not v: return .5
-    z=v[-min(w,len(v)):]; return float(sum(z)/len(z))
-def transition_prob(v,w,prev):
-    z=v[-min(w+1,len(v)):]; big=1.; total=2.
-    for a,b in zip(z[:-1],z[1:]):
-        if a==prev:
-            total+=1; big+=1 if b==1 else 0
-    return float(big/total)
-def recent_runs(v,max_history=200):
-    z=v[-min(max_history,len(v)):]
-    if not z:return [0]
-    runs=[]; cur=z[0]; ln=1
-    for x in z[1:]:
-        if x==cur:ln+=1
-        else:runs.append(ln);cur=x;ln=1
-    runs.append(ln); return runs
-def change_rate(v,w):
-    z=v[-min(w,len(v)):]
-    if len(z)<2:return .5
-    return float(sum(1 for a,b in zip(z[:-1],z[1:]) if a!=b)/(len(z)-1))
-
-
-def build_features(history,target_issue=None):
-    v=big_values(history); nums=[int(r["number"]) for r in history]
-    last_big=v[-1] if v else 0; last_num=nums[-1] if nums else 4
-    runs=recent_runs(v); rev=list(reversed(runs))
-    r20,r50,r100,r300=[ratio_last(v,w) for w in (20,50,100,300)]
-    n20=nums[-min(20,len(nums)):] if nums else [4,5]; n100=nums[-min(100,len(nums)):] if nums else [4,5]; n50=nums[-min(50,len(nums)):] if nums else [4,5]
-    even20=sum(1 for n in n20 if n%2==0)/max(1,len(n20)); mod3=[sum(1 for n in n50 if n%3==k)/max(1,len(n50)) for k in range(3)]
-    try: issue_int=int(target_issue or increment_issue(history[-1]["issue"]))
-    except Exception: issue_int=0
-    return {
-    "last_is_big":float(last_big),"last_number_norm":last_num/9.,"last_even":float(last_num%2==0),
-    "current_streak":min(20,rev[0] if rev else 0)/20.,"run1":min(20,rev[0] if len(rev)>0 else 0)/20.,"run2":min(20,rev[1] if len(rev)>1 else 0)/20.,"run3":min(20,rev[2] if len(rev)>2 else 0)/20.,"run_mean_200":float(np.mean(runs)/10.),"run_std_200":float(np.std(runs)/10.),"run_max_200":min(30,max(runs) if runs else 0)/30.,
-    "big_ratio_20":r20,"big_ratio_50":r50,"big_ratio_100":r100,"big_ratio_300":r300,"dev_20_100":r20-r100,"dev_20_300":r20-r300,"dev_100_300":r100-r300,
-    "p_big_after_big_100":transition_prob(v,100,1),"p_big_after_small_100":transition_prob(v,100,0),"p_big_after_big_300":transition_prob(v,300,1),"p_big_after_small_300":transition_prob(v,300,0),
-    "num_mean_20":float(np.mean(n20)/9.),"num_std_20":float(np.std(n20)/4.5),"num_mean_100":float(np.mean(n100)/9.),"num_std_100":float(np.std(n100)/4.5),"sum_last5_norm":float(sum(nums[-5:])/45. if nums else .5),"last_distance_45":abs(last_num-4.5)/4.5,"even_ratio_20":float(even20),"mod3_0_50":float(mod3[0]),"mod3_1_50":float(mod3[1]),"mod3_2_50":float(mod3[2]),
-    "change_rate_20":change_rate(v,20),"change_rate_100":change_rate(v,100),"entropy_20":entropy_binary(r20),"entropy_100":entropy_binary(r100),"short_long_shift":abs(r20-r100),
-    "issue_mod_2":float(issue_int%2),"issue_mod_3":float((issue_int%3)/2.) if issue_int else 0.,"issue_mod_5":float((issue_int%5)/4.) if issue_int else 0.,"issue_mod_7":float((issue_int%7)/6.) if issue_int else 0.,"issue_mod_11":float((issue_int%11)/10.) if issue_int else 0.}
-
-
-def features_to_vector(f): return np.array([float(f.get(k,0.)) for k in FEATURE_NAMES],dtype=float)
-def build_dataset(rounds,min_context=20):
-    X=[];y=[];idxs=[]
-    for i in range(min_context,len(rounds)):
-        X.append(features_to_vector(build_features(rounds[:i],rounds[i]["issue"]))); y.append(1 if rounds[i]["size"]=="big" else 0); idxs.append(i)
-    return (np.vstack(X),np.asarray(y,dtype=int),idxs) if X else (np.zeros((0,len(FEATURE_NAMES))),np.zeros((0,),dtype=int),[])
-
-
-@dataclass
-class FittedModels:
-    scaler:Optional[StandardScaler]; logistic:Optional[LogisticRegression]; tree:Optional[HistGradientBoostingClassifier]; constant:Optional[float]=None
-
-def fit_models(X,y):
-    if len(y)==0:return FittedModels(None,None,None,.5)
-    u=np.unique(y)
-    if len(u)<2:return FittedModels(None,None,None,float(u[0]))
-    sc=StandardScaler(); xs=sc.fit_transform(X)
-    lr=LogisticRegression(C=.5,penalty="l2",solver="lbfgs",max_iter=500,random_state=42); lr.fit(xs,y)
-    tr=HistGradientBoostingClassifier(max_iter=60,learning_rate=.05,max_depth=3,min_samples_leaf=20,l2_regularization=1.,random_state=42); tr.fit(X,y)
-    return FittedModels(sc,lr,tr,None)
-
-def model_probs(m,x):
-    if m.constant is not None:return float(m.constant),float(m.constant)
-    x2=x.reshape(1,-1); return float(m.logistic.predict_proba(m.scaler.transform(x2))[0,1]),float(m.tree.predict_proba(x2)[0,1])
-
-def markov_probability(history):
-    v=big_values(history)
-    if not v:return .5,0,0
-    for order in (3,2,1):
-        if len(v)<=order:continue
-        ctx=tuple(v[-order:]); big=1.; total=2.; support=0
-        for i in range(order,len(v)):
-            if tuple(v[i-order:i])==ctx:
-                support+=1; total+=1; big+=1 if v[i]==1 else 0
-        if support>={3:5,2:8,1:12}[order]:return float(big/total),order,support
-    z=v[-min(300,len(v)):]; return float((sum(z)+2)/(len(z)+4)),0,len(z)
-
-def ensemble_probability(m,x,h):
-    pl,pt=model_probs(m,x); pm,o,s=markov_probability(h); p=.4*pl+.4*pt+.2*pm; votes=[int(pl>=.5),int(pt>=.5),int(pm>=.5)]
-    return {"p_big_raw":clip_prob(p),"p_logistic":clip_prob(pl),"p_tree":clip_prob(pt),"p_markov":clip_prob(pm),"markov_order":o,"markov_support":s,"agreement":max(votes.count(0),votes.count(1))}
-
-
-def safe_metrics(y,probs):
-    if not y:return {"samples":0,"accuracy":None,"brier":None,"log_loss":None}
-    yy=np.asarray(y,dtype=int); pp=np.asarray([clip_prob(x) for x in probs]); pred=(pp>=.5).astype(int)
-    try:ll=float(log_loss(yy,pp,labels=[0,1]))
-    except Exception:ll=None
-    return {"samples":len(yy),"accuracy":float(accuracy_score(yy,pred)),"brier":float(brier_score_loss(yy,pp)),"log_loss":ll}
-
-def fit_iso(probs,labels):
-    if len(probs)<40 or len(set(labels))<2:return None
-    try:
-        iso=IsotonicRegression(y_min=.02,y_max=.98,out_of_bounds="clip"); iso.fit(np.asarray(probs),np.asarray(labels)); return iso
-    except Exception:return None
-
-def apply_iso(iso,p):
-    if iso is None:return clip_prob(p)
-    try:return clip_prob(float(iso.predict([p])[0]))
-    except Exception:return clip_prob(p)
-
-def confidence_curve(labels,probs):
-    out=[]; total=len(labels)
-    for t in (.52,.55,.58,.60,.62,.65,.70):
-        ys=[];ps=[]
-        for y,p in zip(labels,probs):
-            if max(p,1-p)>=t:ys.append(y);ps.append(1 if p>=.5 else 0)
-        n=len(ys); acc=sum(int(a==b) for a,b in zip(ys,ps))/n if n else None
-        out.append({"threshold":t,"samples":n,"coverage":n/total if total else 0.,"accuracy":float(acc) if acc is not None else None})
-    return out
-
-
-def walk_forward_report(rounds):
-    X,y,idxs=build_dataset(rounds)
-    if len(y)<MIN_TRAIN+EMBARGO+10:return {"status":"insufficient_history","samples":len(y),"minimum_needed":MIN_TRAIN+EMBARGO+10,"raw":safe_metrics([],[]),"calibrated_eval":safe_metrics([],[]),"confidence_curve":[],"calibrator":None,"oos_labels":[],"oos_probs":[]}
-    labels=[];probs=[];folds=0; train_end=MIN_TRAIN
-    while True:
-        vs=train_end+EMBARGO
-        if vs>=len(y):break
-        ve=min(len(y),vs+BACKTEST_BLOCK)
-        m=fit_models(X[:train_end],y[:train_end])
-        for j in range(vs,ve):
-            hist=rounds[:idxs[j]]; probs.append(ensemble_probability(m,X[j],hist)["p_big_raw"]); labels.append(int(y[j]))
-        folds+=1; train_end+=BACKTEST_BLOCK
-        if ve>=len(y):break
-    raw=safe_metrics(labels,probs); iso=None; cal_eval=safe_metrics([],[]); cal_all=list(probs)
-    if len(probs)>=60:
-        sp=max(40,int(len(probs)*.70)); first=fit_iso(probs[:sp],labels[:sp])
-        if first is not None and labels[sp:]: cal_eval=safe_metrics(labels[sp:],[apply_iso(first,p) for p in probs[sp:]])
-        iso=fit_iso(probs,labels)
-        if iso is not None:cal_all=[apply_iso(iso,p) for p in probs]
-    return {"status":"ok","folds":folds,"samples":len(labels),"raw":raw,"calibrated_eval":cal_eval,"confidence_curve":confidence_curve(labels,cal_all),"calibrator":iso,"oos_labels":labels,"oos_probs":cal_all}
-
-
-def ablation_report(rounds):
-    X,y,_=build_dataset(rounds)
-    if len(y)<MIN_TRAIN+EMBARGO+25:return []
-    split=max(MIN_TRAIN,int(len(y)*.75)); test_start=min(len(y),split+EMBARGO)
-    if len(y)-test_start<15:return []
-    order=["base","streak","multiscale","transition","number","regime","issue_experimental"]; n2i={n:i for i,n in enumerate(FEATURE_NAMES)}; selected=[];out=[]
-    for g in order:
-        selected+=FEATURE_GROUPS[g]; ids=[n2i[n] for n in selected]; xt=X[:split][:,ids]; yt=y[:split]; xv=X[test_start:][:,ids]; yv=y[test_start:]
-        if len(set(yt.tolist()))<2:continue
-        sc=StandardScaler(); xt=sc.fit_transform(xt); xv=sc.transform(xv); lr=LogisticRegression(C=.5,max_iter=400,random_state=42);lr.fit(xt,yt);p=lr.predict_proba(xv)[:,1]
-        out.append({"through_group":g,"feature_count":len(ids),**safe_metrics(yv.tolist(),p.tolist())})
-    return out
-
-
-def current_regime(h):
-    v=big_values(h); r20=ratio_last(v,20);r100=ratio_last(v,100);e=entropy_binary(r20);cr=change_rate(v,20)
-    if e>=.98 and abs(r20-r100)<.08:return "HIGH_ENTROPY"
-    if abs(r20-r100)>=.18:return "SHIFT"
-    if cr>=.70:return "CHOPPY"
-    if cr<=.30:return "STREAKY"
-    return "NEUTRAL"
-
-def feature_contributions(m,x):
-    if m.constant is not None or m.logistic is None:return []
-    z=(x-m.scaler.mean_)/np.where(m.scaler.scale_==0,1.,m.scaler.scale_); c=z*m.logistic.coef_[0];out=[]
-    for n,v,k in zip(FEATURE_NAMES,x,c):out.append({"feature":n,"value":float(v),"contribution":float(k),"direction":"BIG" if k>0 else "SMALL"})
-    return sorted(out,key=lambda r:abs(r["contribution"]),reverse=True)[:10]
-
-
-def build_v9_prediction(rounds, full_eval=False):
-    if not rounds:
-        return {"ready":False,"reason":"no_history","model_version":MODEL_VERSION}
-
-    target=increment_issue(rounds[-1]["issue"])
-    if len(rounds)<max(40,MIN_TRAIN//2):
-        return {"ready":False,"reason":"insufficient_history","history":len(rounds),"minimum":max(40,MIN_TRAIN//2),"issue":target,"model_version":MODEL_VERSION}
-
-    # Live fit uses only a bounded recent window so ingest never triggers an
-    # expensive full-history rebuild on the request thread.
-    live_rounds=rounds[-min(LIVE_TRAIN_LIMIT,len(rounds)):]
-    X,y,_=build_dataset(live_rounds)
-
-    with MODEL_LOCK:
-        m=fit_models(X,y)
-        f=build_features(live_rounds,target)
-        x=features_to_vector(f)
-        e=ensemble_probability(m,x,live_rounds)
-
-        iso=MODEL_CACHE.get("calibrator")
-        report_public=MODEL_CACHE.get("report")
-        ablation=MODEL_CACHE.get("ablation")
-
-        # Full walk-forward evaluation is deliberately periodic/background-only.
-        if full_eval:
-            report=walk_forward_report(rounds)
-            iso=report.get("calibrator")
-            report_public={k:v for k,v in report.items() if k not in {"calibrator","oos_labels","oos_probs"}}
-            ablation=ablation_report(rounds)
-            MODEL_CACHE["calibrator"]=iso
-            MODEL_CACHE["report"]=report_public
-            MODEL_CACHE["ablation"]=ablation
-
-        p_raw=e["p_big_raw"]
-        p_cal=apply_iso(iso,p_raw)
-        predicted="big" if p_cal>=.5 else "small"
-        conf=max(p_cal,1-p_cal)
-        regime=current_regime(live_rounds)
-        reasons=[]
-        signal="PREDICT"
-
-        oos_samples=int((report_public or {}).get("samples") or 0)
-        if conf<SIGNAL_THRESHOLD:
-            signal="SKIP";reasons.append("confidence_below_threshold")
-        if oos_samples<50:
-            signal="SKIP";reasons.append("insufficient_out_of_sample_support")
-        if regime=="HIGH_ENTROPY" and conf<max(.65,SIGNAL_THRESHOLD):
-            signal="SKIP";reasons.append("high_entropy_regime")
-        if e["agreement"]<2:
-            signal="SKIP";reasons.append("low_model_agreement")
-
-        pred={
-            "ready":True,
-            "issue":target,
-            "created_at":time.time(),
-            "model_version":MODEL_VERSION,
-            "predicted_size":predicted,
-            "p_big_raw":p_raw,
-            "p_big_calibrated":p_cal,
-            "confidence":conf,
-            "threshold":SIGNAL_THRESHOLD,
-            "signal":signal,
-            "signal_reasons":reasons,
-            "regime":regime,
-            "agreement":e["agreement"],
-            "models":{
-                "logistic":e["p_logistic"],
-                "boosted_tree":e["p_tree"],
-                "markov":e["p_markov"],
-                "markov_order":e["markov_order"],
-                "markov_support":e["markov_support"],
-            },
-            "calibration":{
-                "available":iso is not None,
-                "method":"isotonic" if iso is not None else "none",
-                "oos_samples":oos_samples,
-            },
-            "feature_contributions":feature_contributions(m,x),
-            "verified":0,
-            "actual_size":None,
-            "size_win":None,
+        return {
+            state: max(float(scores.get(state, 0.0)), 0.0) / total
+            for state in states
         }
-        MODEL_CACHE["history_issue"]=rounds[-1]["issue"]
-        MODEL_CACHE["prediction"]=pred
-        return pred
+
+    def ema_distribution(
+        self,
+        sequence: Sequence[Hashable],
+        states: Sequence[Hashable],
+    ) -> Dict[Hashable, float]:
+        scores = {state: 1.0 for state in states}
+
+        if not sequence:
+            return self.normalize(scores, states)
+
+        newest_index = len(sequence) - 1
+
+        for index, value in enumerate(sequence):
+            if value not in scores:
+                continue
+
+            distance = newest_index - index
+            scores[value] += self.ema_decay ** distance
+
+        return self.normalize(scores, states)
+
+    def markov_distribution(
+        self,
+        sequence: Sequence[Hashable],
+        states: Sequence[Hashable],
+    ) -> Tuple[Dict[Hashable, float], int]:
+        scores = {state: 1.0 for state in states}
+
+        if len(sequence) < 2:
+            return self.normalize(scores, states), 0
+
+        current = sequence[-1]
+        support = 0
+
+        for i in range(len(sequence) - 1):
+            if sequence[i] != current:
+                continue
+
+            nxt = sequence[i + 1]
+            if nxt in scores:
+                scores[nxt] += 1.0
+                support += 1
+
+        return self.normalize(scores, states), support
+
+    def ngram_distribution(
+        self,
+        sequence: Sequence[Hashable],
+        states: Sequence[Hashable],
+        max_order: int = 5,
+    ) -> Tuple[Dict[Hashable, float], int, int]:
+        if len(sequence) < 4:
+            return self.normalize({s: 1.0 for s in states}, states), 0, 0
+
+        max_order = min(max_order, len(sequence) - 1)
+
+        for order in range(max_order, 0, -1):
+            context = tuple(sequence[-order:])
+            scores = {state: 1.0 for state in states}
+            support = 0
+
+            # The current trailing context itself is not allowed to have a future.
+            for i in range(0, len(sequence) - order):
+                historical_context = tuple(sequence[i:i + order])
+
+                if historical_context != context:
+                    continue
+
+                next_index = i + order
+                if next_index >= len(sequence):
+                    continue
+
+                nxt = sequence[next_index]
+                if nxt in scores:
+                    scores[nxt] += 1.0
+                    support += 1
+
+            if support >= 2:
+                return self.normalize(scores, states), support, order
+
+        return self.normalize({s: 1.0 for s in states}, states), 0, 0
+
+    def streak_distribution(
+        self,
+        sequence: Sequence[Hashable],
+        states: Sequence[Hashable],
+    ) -> Tuple[Dict[Hashable, float], int]:
+        scores = {state: 1.0 for state in states}
+
+        if not sequence:
+            return self.normalize(scores, states), 0
+
+        latest = sequence[-1]
+        streak = 1
+
+        for i in range(len(sequence) - 2, -1, -1):
+            if sequence[i] != latest:
+                break
+            streak += 1
+
+        if streak >= 4:
+            scores[latest] += 2.0
+        elif streak == 3:
+            scores[latest] += 1.25
+        elif streak == 2:
+            scores[latest] += 0.5
+
+        return self.normalize(scores, states), streak
+
+    @staticmethod
+    def normalized_entropy(distribution: Dict[Hashable, float]) -> float:
+        if len(distribution) <= 1:
+            return 0.0
+
+        entropy = 0.0
+
+        for probability in distribution.values():
+            p = float(probability)
+            if p > 0:
+                entropy -= p * math.log2(p)
+
+        maximum = math.log2(len(distribution))
+        return entropy / maximum if maximum > 0 else 0.0
+
+    @staticmethod
+    def gap_since_previous_same(sequence: Sequence[Hashable]) -> int:
+        if len(sequence) < 2:
+            return len(sequence)
+
+        target = sequence[-1]
+
+        for distance in range(1, len(sequence)):
+            if sequence[-1 - distance] == target:
+                return distance
+
+        return len(sequence)
+
+    @staticmethod
+    def volatility(sequence: Sequence[Hashable], window: int = 20) -> float:
+        seq = list(sequence[-window:])
+
+        if len(seq) < 2:
+            return 0.5
+
+        changes = sum(
+            1
+            for i in range(1, len(seq))
+            if seq[i] != seq[i - 1]
+        )
+
+        return changes / (len(seq) - 1)
+
+    # ---------------------------------------------------------
+    # Feature and joint state helpers
+    # ---------------------------------------------------------
+
+    @staticmethod
+    def joint_state(game: Dict[str, Any]) -> Tuple[str, str, str]:
+        return (
+            game["color"],
+            game["size"],
+            game["parity"],
+        )
+
+    @staticmethod
+    def joint_key(state: Tuple[str, str, str]) -> str:
+        return "|".join(state)
+
+    def combined_volatility(self, games: List[Dict[str, Any]], window: int = 20) -> float:
+        recent = games[-window:]
+
+        if len(recent) < 2:
+            return 0.5
+
+        values = []
+
+        for feature in ("color", "size", "parity"):
+            seq = [game[feature] for game in recent]
+            values.append(self.volatility(seq, window=len(seq)))
+
+        return sum(values) / len(values)
+
+    @staticmethod
+    def regime_from_volatility(volatility: float) -> str:
+        if volatility < 0.30:
+            return "stable"
+        if volatility > 0.70:
+            return "choppy"
+        return "normal"
+
+    def regime_weights(
+        self,
+        volatility: float,
+        markov_support: int,
+        pattern_support: int,
+        pattern_order: int,
+        context_support: int = 0,
+        include_context: bool = False,
+    ) -> Dict[str, float]:
+        regime = self.regime_from_volatility(volatility)
+
+        if regime == "stable":
+            raw = {
+                "ema": 0.10,
+                "markov": 0.45,
+                "pattern": 0.10,
+                "streak": 0.25,
+            }
+        elif regime == "choppy":
+            raw = {
+                "ema": 0.40,
+                "markov": 0.10,
+                "pattern": 0.30,
+                "streak": 0.05,
+            }
+        else:
+            raw = {
+                "ema": 0.25,
+                "markov": 0.25,
+                "pattern": 0.25,
+                "streak": 0.10,
+            }
+
+        # Evidence-sensitive adjustment. Weak models get less say.
+        markov_strength = min(markov_support / 20.0, 1.0)
+        pattern_strength = min(pattern_support / 10.0, 1.0)
+        order_strength = min(pattern_order / 5.0, 1.0) if pattern_order else 0.0
+
+        raw["markov"] *= 0.30 + 0.70 * markov_strength
+        raw["pattern"] *= 0.20 + 0.80 * pattern_strength * max(order_strength, 0.2)
+
+        if include_context:
+            context_strength = min(context_support / 15.0, 1.0)
+            raw["context"] = 0.15 * (0.25 + 0.75 * context_strength)
+
+        total = sum(raw.values())
+        return {name: value / total for name, value in raw.items()}
+
+    def context_distribution(
+        self,
+        games: List[Dict[str, Any]],
+        feature: str,
+        states: Sequence[Hashable],
+    ) -> Tuple[Dict[Hashable, float], int]:
+        scores = {state: 1.0 for state in states}
+
+        if len(games) < 2:
+            return self.normalize(scores, states), 0
+
+        current_context = self.joint_state(games[-1])
+        support = 0
+
+        for i in range(len(games) - 1):
+            if self.joint_state(games[i]) != current_context:
+                continue
+
+            nxt = games[i + 1][feature]
+            if nxt in scores:
+                scores[nxt] += 1.0
+                support += 1
+
+        return self.normalize(scores, states), support
+
+    # ---------------------------------------------------------
+    # Individual feature model
+    # ---------------------------------------------------------
+
+    def predict_feature(
+        self,
+        games: List[Dict[str, Any]],
+        feature: str,
+        states: Sequence[Hashable],
+    ) -> Dict[str, Any]:
+        sequence = [game[feature] for game in games]
+        vol = self.combined_volatility(games)
+
+        ema = self.ema_distribution(sequence, states)
+        markov, markov_support = self.markov_distribution(sequence, states)
+        pattern, pattern_support, pattern_order = self.ngram_distribution(sequence, states)
+        streak, streak_length = self.streak_distribution(sequence, states)
+        context, context_support = self.context_distribution(games, feature, states)
+
+        weights = self.regime_weights(
+            volatility=vol,
+            markov_support=markov_support,
+            pattern_support=pattern_support,
+            pattern_order=pattern_order,
+            context_support=context_support,
+            include_context=True,
+        )
+
+        scores: Dict[Hashable, float] = {}
+
+        for state in states:
+            scores[state] = (
+                ema[state] * weights["ema"]
+                + markov[state] * weights["markov"]
+                + pattern[state] * weights["pattern"]
+                + streak[state] * weights["streak"]
+                + context[state] * weights["context"]
+            )
+
+        scores = self.normalize(scores, states)
+        ordered = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+
+        prediction = ordered[0][0]
+        score = float(ordered[0][1])
+        margin = score - float(ordered[1][1])
+
+        return {
+            "prediction": prediction,
+            "score": score,
+            "margin": margin,
+            "entropy": self.normalized_entropy(scores),
+            "distribution": scores,
+            "weights": weights,
+            "markov_support": markov_support,
+            "pattern_support": pattern_support,
+            "pattern_order": pattern_order,
+            "context_support": context_support,
+            "streak_length": streak_length,
+            "gap_current": self.gap_since_previous_same(sequence),
+            "total_support": markov_support + pattern_support + context_support,
+        }
+
+    # ---------------------------------------------------------
+    # Joint-state model
+    # ---------------------------------------------------------
+
+    def predict_joint(self, games: List[Dict[str, Any]]) -> Dict[str, Any]:
+        sequence = [self.joint_state(game) for game in games]
+
+        # Learn valid joint states from observed history.
+        states = sorted(set(sequence))
+
+        if len(states) < 2:
+            states = list(set(states) | {
+                ("red", "small", "even"),
+                ("green", "small", "odd"),
+            })
+
+        vol = self.combined_volatility(games)
+
+        ema = self.ema_distribution(sequence, states)
+        markov, markov_support = self.markov_distribution(sequence, states)
+        pattern, pattern_support, pattern_order = self.ngram_distribution(sequence, states)
+        streak, streak_length = self.streak_distribution(sequence, states)
+
+        weights = self.regime_weights(
+            volatility=vol,
+            markov_support=markov_support,
+            pattern_support=pattern_support,
+            pattern_order=pattern_order,
+            include_context=False,
+        )
+
+        scores: Dict[Hashable, float] = {}
+
+        for state in states:
+            scores[state] = (
+                ema[state] * weights["ema"]
+                + markov[state] * weights["markov"]
+                + pattern[state] * weights["pattern"]
+                + streak[state] * weights["streak"]
+            )
+
+        scores = self.normalize(scores, states)
+        ordered = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+
+        prediction = ordered[0][0]
+        score = float(ordered[0][1])
+        second = float(ordered[1][1]) if len(ordered) > 1 else 0.0
+
+        return {
+            "prediction": prediction,
+            "score": score,
+            "margin": score - second,
+            "entropy": self.normalized_entropy(scores),
+            "distribution": scores,
+            "weights": weights,
+            "markov_support": markov_support,
+            "pattern_support": pattern_support,
+            "pattern_order": pattern_order,
+            "streak_length": streak_length,
+            "gap_current": self.gap_since_previous_same(sequence),
+            "total_support": markov_support + pattern_support,
+            "volatility": vol,
+            "regime": self.regime_from_volatility(vol),
+        }
+
+    # ---------------------------------------------------------
+    # V7 number-first adaptive model
+    # ---------------------------------------------------------
+
+    @staticmethod
+    def features_from_number(number: int) -> Tuple[str, str, str]:
+        # Matches the API parsing convention used by this project:
+        # violet takes precedence for 0/5; otherwise even=red, odd=green.
+        if number in (0, 5):
+            color = "violet"
+        else:
+            color = "red" if number % 2 == 0 else "green"
+        size = "big" if number >= 5 else "small"
+        parity = "even" if number % 2 == 0 else "odd"
+        return color, size, parity
+
+    def frequency_number_distribution(self, sequence: Sequence[int], window: int = 100) -> Dict[int, float]:
+        scores = {n: 1.0 for n in NUMBER_STATES}
+        for value in list(sequence)[-window:]:
+            if value in scores:
+                scores[value] += 1.0
+        return self.normalize(scores, NUMBER_STATES)
+
+    def candidate_number_distributions(self, sequence: Sequence[int]) -> Dict[str, Dict[int, float]]:
+        ema = self.ema_distribution(sequence, NUMBER_STATES)
+        markov, _ = self.markov_distribution(sequence, NUMBER_STATES)
+        pattern, _, _ = self.ngram_distribution(sequence, NUMBER_STATES, max_order=3)
+        freq = self.frequency_number_distribution(sequence)
+        return {"ema": ema, "markov": markov, "pattern": pattern, "frequency": freq}
+
+    def walk_forward_model_scores(
+        self,
+        sequence: Sequence[int],
+        lookback: int = 80,
+        min_train: int = 30,
+    ) -> Dict[str, Dict[str, float]]:
+        names = ("ema", "markov", "pattern", "frequency")
+        stats = {name: {"correct": 0.0, "tested": 0.0, "logloss": 0.0} for name in names}
+
+        start = max(min_train, len(sequence) - lookback)
+        for target_index in range(start, len(sequence)):
+            train = list(sequence[:target_index])
+            actual = int(sequence[target_index])
+            candidates = self.candidate_number_distributions(train)
+
+            for name, dist in candidates.items():
+                predicted = max(dist, key=dist.get)
+                stats[name]["tested"] += 1.0
+                stats[name]["correct"] += float(predicted == actual)
+                stats[name]["logloss"] += -math.log(max(float(dist.get(actual, 0.0)), 1e-9))
+
+        for name in names:
+            tested = stats[name]["tested"]
+            if tested:
+                stats[name]["accuracy"] = stats[name]["correct"] / tested
+                stats[name]["logloss"] /= tested
+            else:
+                stats[name]["accuracy"] = 0.10
+                stats[name]["logloss"] = math.log(10.0)
+        return stats
+
+    def adaptive_number_weights(self, sequence: Sequence[int]) -> Tuple[Dict[str, float], Dict[str, Dict[str, float]]]:
+        stats = self.walk_forward_model_scores(sequence)
+        raw = {}
+
+        # Weight by out-of-sample probability quality, not in-sample fit.
+        # exp(-logloss) is bounded and avoids a lucky tiny sample dominating.
+        for name, row in stats.items():
+            tested = max(row["tested"], 1.0)
+            reliability = min(tested / 50.0, 1.0)
+            quality = math.exp(-float(row["logloss"]))
+            raw[name] = 0.05 + reliability * quality
+
+        total = sum(raw.values())
+        return ({name: value / total for name, value in raw.items()}, stats)
+
+    def predict_number(self, games: List[Dict[str, Any]]) -> Dict[str, Any]:
+        sequence = [int(game["number"]) for game in games]
+        candidates = self.candidate_number_distributions(sequence)
+        weights, backtest = self.adaptive_number_weights(sequence)
+
+        distribution = {
+            n: sum(weights[name] * candidates[name][n] for name in candidates)
+            for n in NUMBER_STATES
+        }
+        distribution = self.normalize(distribution, NUMBER_STATES)
+        ordered = sorted(distribution.items(), key=lambda item: item[1], reverse=True)
+
+        prediction = int(ordered[0][0])
+        score = float(ordered[0][1])
+        margin = score - float(ordered[1][1])
+
+        return {
+            "prediction": prediction,
+            "score": score,
+            "margin": margin,
+            "entropy": self.normalized_entropy(distribution),
+            "distribution": distribution,
+            "weights": weights,
+            "backtest": backtest,
+        }
+
+    # ---------------------------------------------------------
+    # Prediction decision
+    # ---------------------------------------------------------
+
+    @staticmethod
+    def agreement_count(
+        joint_prediction: Tuple[str, str, str],
+        color_prediction: str,
+        size_prediction: str,
+        parity_prediction: str,
+    ) -> int:
+        expected = (
+            color_prediction,
+            size_prediction,
+            parity_prediction,
+        )
+
+        return sum(
+            1
+            for joint_value, individual_value in zip(joint_prediction, expected)
+            if joint_value == individual_value
+        )
+
+    @staticmethod
+    def signal_quality(
+        joint: Dict[str, Any],
+        agreement: int,
+    ) -> str:
+        entropy = float(joint["entropy"])
+        score = float(joint["score"])
+        margin = float(joint["margin"])
+        support = int(joint["total_support"])
+
+        if entropy >= 0.90:
+            return "SKIP"
+
+        if support < 5:
+            return "SKIP"
+
+        if agreement <= 1:
+            return "SKIP"
+
+        if (
+            entropy <= 0.62
+            and score >= 0.45
+            and margin >= 0.10
+            and agreement == 3
+        ):
+            return "HIGH"
+
+        return "MEDIUM"
+
+    def build_prediction(self, games: List[Dict[str, Any]]) -> Dict[str, Any]:
+        number = self.predict_number(games)
+        color_value, size_value, parity_value = self.features_from_number(number["prediction"])
+
+        # Keep the old feature models only as diagnostics/agreement checks.
+        color = self.predict_feature(games, "color", COLOR_STATES)
+        size = self.predict_feature(games, "size", SIZE_STATES)
+        parity = self.predict_feature(games, "parity", PARITY_STATES)
+
+        joint_state = (color_value, size_value, parity_value)
+        agreement = self.agreement_count(
+            joint_state,
+            color["prediction"],
+            size["prediction"],
+            parity["prediction"],
+        )
+
+        # V7 confidence is deliberately conservative. A ten-way digit model
+        # should not claim HIGH confidence from a small sample.
+        signal = "SKIP"
+        if number["score"] >= 0.18 and number["margin"] >= 0.025 and agreement >= 2:
+            signal = "MEDIUM"
+
+        joint = {
+            "prediction": joint_state,
+            "score": number["score"],
+            "margin": number["margin"],
+            "entropy": number["entropy"],
+            "distribution": {},
+            "weights": number["weights"],
+            "total_support": len(games),
+            "volatility": self.combined_volatility(games),
+            "regime": self.regime_from_volatility(self.combined_volatility(games)),
+            "number_prediction": number["prediction"],
+            "number_distribution": number["distribution"],
+            "backtest": number["backtest"],
+        }
+
+        return {
+            "joint": joint,
+            "number": number,
+            "color": color,
+            "size": size,
+            "parity": parity,
+            "agreement": agreement,
+            "signal": signal,
+        }
+
+    # ---------------------------------------------------------
+    # Save / verify predictions
+    # ---------------------------------------------------------
+
+    @staticmethod
+    def get_next_issue(current_issue: str) -> str:
+        try:
+            return str(int(current_issue) + 1)
+        except ValueError:
+            return f"{current_issue}_NEXT"
+
+    def save_next_prediction(self, games: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if len(games) < MIN_HISTORY:
+            return None
+
+        latest = games[-1]
+        target_issue = self.get_next_issue(latest["issue"])
+
+        if self.prediction_exists(target_issue):
+            return None
+
+        result = self.build_prediction(games)
+
+        joint_state = result["joint"]["prediction"]
+        number_prediction = int(result["number"]["prediction"])
+        color_prediction = str(joint_state[0])
+        size_prediction = str(joint_state[1])
+        parity_prediction = str(joint_state[2])
+
+        with self._connect() as conn:
+            conn.execute("""
+                INSERT OR IGNORE INTO predictions (
+                    issue,
+                    based_on_issue,
+
+                    joint_state,
+                    predicted_color,
+                    predicted_size,
+                    predicted_parity,
+                    predicted_number,
+
+                    joint_score,
+                    joint_margin,
+                    joint_entropy,
+                    joint_support,
+                    agreement_count,
+                    regime,
+                    volatility,
+                    signal,
+
+                    color_score,
+                    size_score,
+                    parity_score,
+
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                target_issue,
+                latest["issue"],
+
+                self.joint_key(joint_state),
+                color_prediction,
+                size_prediction,
+                parity_prediction,
+                number_prediction,
+
+                float(result["joint"]["score"]),
+                float(result["joint"]["margin"]),
+                float(result["joint"]["entropy"]),
+                int(result["joint"]["total_support"]),
+                int(result["agreement"]),
+                str(result["joint"]["regime"]),
+                float(result["joint"]["volatility"]),
+                str(result["signal"]),
+
+                float(result["color"]["score"]),
+                float(result["size"]["score"]),
+                float(result["parity"]["score"]),
+
+                int(time.time()),
+            ))
+            conn.commit()
+
+        return self.get_prediction(target_issue)
+
+    def verify_pending_predictions(self) -> int:
+        verified_now = 0
+
+        with self._connect() as conn:
+            pending = conn.execute("""
+                SELECT *
+                FROM predictions
+                WHERE verified = 0
+                ORDER BY created_at ASC
+            """).fetchall()
+
+            for prediction in pending:
+                actual = conn.execute("""
+                    SELECT *
+                    FROM rounds
+                    WHERE issue = ?
+                """, (prediction["issue"],)).fetchone()
+
+                if actual is None:
+                    continue
+
+                joint_win = int(
+                    prediction["predicted_color"] == actual["color"]
+                    and prediction["predicted_size"] == actual["size"]
+                    and prediction["predicted_parity"] == actual["parity"]
+                )
+
+                color_win = int(prediction["predicted_color"] == actual["color"])
+                size_win = int(prediction["predicted_size"] == actual["size"])
+                parity_win = int(prediction["predicted_parity"] == actual["parity"])
+
+                conn.execute("""
+                    UPDATE predictions
+                    SET
+                        verified = 1,
+                        actual_color = ?,
+                        actual_size = ?,
+                        actual_parity = ?,
+                        joint_win = ?,
+                        color_win = ?,
+                        size_win = ?,
+                        parity_win = ?
+                    WHERE issue = ?
+                """, (
+                    actual["color"],
+                    actual["size"],
+                    actual["parity"],
+                    joint_win,
+                    color_win,
+                    size_win,
+                    parity_win,
+                    prediction["issue"],
+                ))
+
+                verified_now += 1
+
+            conn.commit()
+
+        return verified_now
+
+    # ---------------------------------------------------------
+    # Backfill and worker
+    # ---------------------------------------------------------
+
+    def backfill(self) -> None:
+        existing = self.count_rounds()
+
+        if existing >= BACKFILL_TARGET:
+            return
+
+        seen = set()
+        page_no = 1
+        max_pages = 25
+
+        while (
+            self.count_rounds() < BACKFILL_TARGET
+            and page_no <= max_pages
+            and not self.stop_event.is_set()
+        ):
+            data = self.fetch_history(
+                page_no=page_no,
+                page_size=BACKFILL_PAGE_SIZE,
+            )
+
+            if not data or data.get("code") != 0:
+                break
+
+            games = self.parse_api_history(data)
+            if not games:
+                break
+
+            inserted = 0
+
+            for game in games:
+                if game["issue"] in seen:
+                    continue
+
+                seen.add(game["issue"])
+
+                if self.save_round(game):
+                    inserted += 1
+
+                if self.count_rounds() >= BACKFILL_TARGET:
+                    break
+
+            try:
+                total_page = int(data.get("data", {}).get("totalPage", page_no))
+            except Exception:
+                total_page = page_no
+
+            if page_no >= total_page:
+                break
+
+            # API may ignore pageNo/pageSize and return the same records.
+            if inserted == 0:
+                break
+
+            page_no += 1
+            time.sleep(0.15)
+
+    def poll_once(self) -> None:
+        self.last_poll_at = int(time.time())
+
+        data = self.fetch_history(page_no=1, page_size=100)
+
+        if not data or data.get("code") != 0:
+            return
+
+        games = self.parse_api_history(data)
+
+        for game in games:
+            self.save_round(game)
+
+        self.verify_pending_predictions()
+
+        stored = self.load_history(HISTORY_LIMIT)
+
+        if not stored:
+            return
+
+        latest_issue = stored[-1]["issue"]
+
+        if latest_issue != self.last_seen_issue:
+            self.last_seen_issue = latest_issue
+            self.save_next_prediction(stored)
+
+    def worker_loop(self) -> None:
+        try:
+            self.backfill()
+        except Exception as exc:
+            self.last_error = f"Backfill: {type(exc).__name__}: {exc}"
+
+        while not self.stop_event.is_set():
+            try:
+                self.poll_once()
+            except Exception as exc:
+                self.last_error = f"Poll: {type(exc).__name__}: {exc}"
+
+            self.stop_event.wait(POLL_SECONDS)
+
+    def start_worker(self) -> None:
+        with self.lock:
+            if self.worker and self.worker.is_alive():
+                return
+
+            self.stop_event.clear()
+            self.worker = threading.Thread(
+                target=self.worker_loop,
+                name="predictor-worker",
+                daemon=True,
+            )
+            self.worker.start()
+
+    def stop_worker(self) -> None:
+        self.stop_event.set()
+
+        if self.worker and self.worker.is_alive():
+            self.worker.join(timeout=3)
+
+    # ---------------------------------------------------------
+    # API serialization helpers
+    # ---------------------------------------------------------
+
+    def get_latest_round(self) -> Optional[Dict[str, Any]]:
+        history = self.load_history(1)
+        return history[-1] if history else None
+
+    def get_prediction(self, issue: str) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM predictions WHERE issue = ?",
+                (issue,),
+            ).fetchone()
+
+        return dict(row) if row else None
+
+    def get_latest_prediction(self) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute("""
+                SELECT *
+                FROM predictions
+                ORDER BY created_at DESC
+                LIMIT 1
+            """).fetchone()
+
+        return dict(row) if row else None
+
+    def recent_rounds(self, limit: int = 30) -> List[Dict[str, Any]]:
+        limit = max(1, min(limit, 200))
+
+        with self._connect() as conn:
+            rows = conn.execute("""
+                SELECT issue, number, color, size, parity, seen_at
+                FROM rounds
+                ORDER BY
+                    CASE
+                        WHEN issue GLOB '[0-9]*' THEN CAST(issue AS INTEGER)
+                        ELSE seen_at
+                    END DESC
+                LIMIT ?
+            """, (limit,)).fetchall()
+
+        return [dict(row) for row in rows]
+
+    def recent_predictions(self, limit: int = 30) -> List[Dict[str, Any]]:
+        limit = max(1, min(limit, 200))
+
+        with self._connect() as conn:
+            rows = conn.execute("""
+                SELECT *
+                FROM predictions
+                ORDER BY created_at DESC
+                LIMIT ?
+            """, (limit,)).fetchall()
+
+        return [dict(row) for row in rows]
+
+    def accuracy_stats(self, window: int = 200) -> Dict[str, Any]:
+        window = max(1, min(window, 1000))
+
+        with self._connect() as conn:
+            rows = conn.execute("""
+                SELECT
+                    joint_win,
+                    color_win,
+                    size_win,
+                    parity_win,
+                    signal
+                FROM predictions
+                WHERE verified = 1
+                ORDER BY created_at DESC
+                LIMIT ?
+            """, (window,)).fetchall()
+
+        def metric(field: str) -> Dict[str, Any]:
+            values = [
+                int(row[field])
+                for row in rows
+                if row[field] is not None
+            ]
+
+            if not values:
+                return {
+                    "correct": 0,
+                    "tested": 0,
+                    "accuracy": None,
+                }
+
+            correct = sum(values)
+            tested = len(values)
+
+            return {
+                "correct": correct,
+                "tested": tested,
+                "accuracy": correct / tested,
+            }
+
+        signal_counts = defaultdict(int)
+        for row in rows:
+            signal_counts[row["signal"]] += 1
+
+        return {
+            "window": window,
+            "joint": metric("joint_win"),
+            "color": metric("color_win"),
+            "size": metric("size_win"),
+            "parity": metric("parity_win"),
+            "signals": dict(signal_counts),
+        }
+
+    def status(self) -> Dict[str, Any]:
+        return {
+            "service": "online",
+            "worker_running": bool(self.worker and self.worker.is_alive()),
+            "db_path": DB_PATH,
+            "stored_rounds": self.count_rounds(),
+            "history_limit": HISTORY_LIMIT,
+            "minimum_history": MIN_HISTORY,
+            "last_poll_at": self.last_poll_at,
+            "last_api_ok_at": self.last_api_ok_at,
+            "last_error": self.last_error,
+        }
 
 
-def latest_saved_prediction_for(rounds):
-    if not rounds:
-        return {"ready":False,"reason":"no_history","model_version":MODEL_VERSION}
+engine = PredictorEngine()
 
-    latest_issue=rounds[-1]["issue"]
-    if MODEL_CACHE.get("history_issue")==latest_issue and MODEL_CACHE.get("prediction"):
-        return MODEL_CACHE["prediction"]
 
-    expected=increment_issue(latest_issue)
-    saved=load_predictions(1)
-    if saved and str(saved[0].get("issue"))==str(expected):
-        p=saved[0]
-        p["ready"]=True
-        return p
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    engine.start_worker()
+    yield
+    engine.stop_worker()
+
+
+
+# ============================================================
+# V9.2 PRO EXPERIMENTAL SIZE ENGINE
+# Walk-forward only; no future leakage; SKIP is first-class.
+# ============================================================
+
+V92_MIN_TRAIN = int(os.getenv("V92_MIN_TRAIN", "80"))
+V92_WINDOW = int(os.getenv("V92_WINDOW", "300"))
+V92_SIGNAL_THRESHOLD = float(os.getenv("V92_SIGNAL_THRESHOLD", "0.72"))
+V92_CHOPPY_THRESHOLD = float(os.getenv("V92_CHOPPY_THRESHOLD", "0.80"))
+V92_ENTROPY_STOP = float(os.getenv("V92_ENTROPY_STOP", "0.75"))
+V92_MIN_SUPPORT = int(os.getenv("V92_MIN_SUPPORT", "50"))
+
+def _b(x):
+    return 1 if str(x).lower() == "big" else 0
+
+def _binary_entropy(p):
+    p = min(max(float(p), 1e-9), 1 - 1e-9)
+    return -(p*math.log2(p) + (1-p)*math.log2(1-p))
+
+def _transition_stats(vals, lookback=30):
+    v = vals[-lookback:]
+    counts = [[1.0, 1.0], [1.0, 1.0]]  # Laplace smoothing
+    for a, b in zip(v[:-1], v[1:]):
+        counts[int(a)][int(b)] += 1.0
+    probs = []
+    for row in counts:
+        s = sum(row)
+        probs.append([row[0]/s, row[1]/s])
+    return probs
+
+def _gap_since(vals, target):
+    gap = 0
+    for x in reversed(vals):
+        if x == target:
+            return gap
+        gap += 1
+    return len(vals)
+
+def _sequence_stability(vals, n=12):
+    """Order-aware stability: low transition entropy + repeatable lag structure."""
+    v = vals[-n:]
+    if len(v) < 5:
+        return 0.5
+    tm = _transition_stats(v, len(v))
+    row_ent = []
+    for row in tm:
+        row_ent.append(_binary_entropy(row[1]))
+    transition_stability = 1.0 - sum(row_ent)/len(row_ent)
+    lag2 = np.mean([1.0 if v[i] == v[i-2] else 0.0 for i in range(2, len(v))])
+    return float(np.clip(0.65*transition_stability + 0.35*lag2, 0, 1))
+
+def _regime(vals):
+    v = vals[-30:]
+    if len(v) < 12:
+        return "UNKNOWN", 1.0
+    p = sum(v)/len(v)
+    entropy = _binary_entropy(p)
+    stability = _sequence_stability(v)
+    # Binary std is a useful volatility proxy, but not a financial-market claim.
+    volatility = float(np.std(v))
+    choppy_score = float(np.clip(0.55*entropy + 0.30*(1-stability) + 0.15*(volatility/0.5), 0, 1))
+    return ("CHOPPY" if choppy_score >= 0.68 else "STABLE"), choppy_score
+
+V92_FEATURE_NAMES = [
+    "big_ratio_5","big_ratio_10","big_ratio_20",
+    "lag1","lag2","lag3",
+    "p_big_after_current","gap_big","gap_small",
+    "run_length","sequence_stability","entropy20","volatility20",
+    "momentum_5_20",
+]
+
+def _feature_row(vals):
+    def ratio(n):
+        z = vals[-n:]
+        return sum(z)/max(len(z),1)
+    tm = _transition_stats(vals, 30)
+    current = vals[-1] if vals else 0
+    run = 1
+    for x in reversed(vals[:-1]):
+        if x == current: run += 1
+        else: break
+    r5, r10, r20 = ratio(5), ratio(10), ratio(20)
+    return np.array([
+        r5, r10, r20,
+        vals[-1] if len(vals)>=1 else .5,
+        vals[-2] if len(vals)>=2 else .5,
+        vals[-3] if len(vals)>=3 else .5,
+        tm[int(current)][1],
+        min(_gap_since(vals,1),20)/20.0,
+        min(_gap_since(vals,0),20)/20.0,
+        min(run,10)/10.0,
+        _sequence_stability(vals),
+        _binary_entropy(r20),
+        float(np.std(vals[-20:] or [0])),
+        r5-r20,
+    ], dtype=float)
+
+def _make_supervised(vals, min_prefix=25):
+    X, y = [], []
+    for i in range(min_prefix, len(vals)):
+        X.append(_feature_row(vals[:i]))
+        y.append(vals[i])
+    return np.asarray(X), np.asarray(y, dtype=int)
+
+def _fit_logistic(train_vals, active_mask=None):
+    X, y = _make_supervised(train_vals)
+    if len(y) < V92_MIN_SUPPORT or len(set(y.tolist())) < 2:
+        return None
+    if active_mask is None:
+        active_mask = np.ones(X.shape[1], dtype=bool)
+    scaler = StandardScaler()
+    Xs = scaler.fit_transform(X[:, active_mask])
+    model = LogisticRegression(max_iter=500, C=0.7)
+    model.fit(Xs, y)
+    return scaler, model, active_mask
+
+def _ablation_mask(train_vals):
+    """Cheap walk-forward-inspired pruning on the training segment only.
+    Feature is kept unless removing it improves training-tail log loss materially.
+    This avoids using the future target being predicted.
+    """
+    X, y = _make_supervised(train_vals)
+    if len(y) < 100 or len(set(y.tolist())) < 2:
+        return np.ones(len(V92_FEATURE_NAMES), dtype=bool), {}
+    cut = max(60, int(len(y)*0.75))
+    Xtr, Xva, ytr, yva = X[:cut], X[cut:], y[:cut], y[cut:]
+    if len(set(ytr.tolist())) < 2 or len(yva) < 10:
+        return np.ones(len(V92_FEATURE_NAMES), dtype=bool), {}
+    def loss(mask):
+        sc = StandardScaler().fit(Xtr[:,mask])
+        m = LogisticRegression(max_iter=400, C=0.7).fit(sc.transform(Xtr[:,mask]), ytr)
+        p = np.clip(m.predict_proba(sc.transform(Xva[:,mask]))[:,1], 1e-6, 1-1e-6)
+        return float(-np.mean(yva*np.log(p)+(1-yva)*np.log(1-p)))
+    full = np.ones(X.shape[1], dtype=bool)
+    base_loss = loss(full)
+    report = {}
+    keep = full.copy()
+    for j, name in enumerate(V92_FEATURE_NAMES):
+        mask = full.copy(); mask[j] = False
+        try:
+            without = loss(mask)
+            importance = without - base_loss
+        except Exception:
+            importance = 0.0
+        report[name] = round(float(importance), 6)
+        # Only prune when removing the feature clearly helps validation loss.
+        if importance < -0.005:
+            keep[j] = False
+    if keep.sum() < 5:
+        keep[:] = True
+    return keep, report
+
+def _markov_probability(vals):
+    tm = _transition_stats(vals, 40)
+    return float(tm[int(vals[-1])][1]) if vals else 0.5
+
+def _momentum_probability(vals):
+    if len(vals) < 20: return 0.5
+    r5 = sum(vals[-5:])/5
+    r20 = sum(vals[-20:])/20
+    return float(np.clip(0.5 + 0.8*(r5-r20), 0.05, 0.95))
+
+def _raw_v92_probability(train_vals, active_mask=None):
+    fit = _fit_logistic(train_vals, active_mask)
+    p_lr = 0.5
+    if fit:
+        sc, model, mask = fit
+        p_lr = float(model.predict_proba(sc.transform(_feature_row(train_vals)[mask].reshape(1,-1)))[0,1])
+    p_mk = _markov_probability(train_vals)
+    p_mo = _momentum_probability(train_vals)
+    regime, _ = _regime(train_vals)
+    # Regime-specific ensemble. Weights are hypotheses, not claims of predictive edge.
+    if regime == "CHOPPY":
+        p = 0.25*p_lr + 0.50*p_mk + 0.25*p_mo
+    else:
+        p = 0.50*p_lr + 0.20*p_mk + 0.30*p_mo
+    return float(np.clip(p, .02, .98)), (p_lr,p_mk,p_mo)
+
+def _walkforward_calibration(vals, active_mask):
+    raw, actual = [], []
+    start = max(V92_MIN_TRAIN, 40)
+    # Bound CPU/RAM on small cloud instances.
+    first = max(start, len(vals)-120)
+    for i in range(first, len(vals)):
+        tr = vals[max(0,i-V92_WINDOW):i]
+        if len(tr) < start: continue
+        try:
+            p, _ = _raw_v92_probability(tr, active_mask)
+            raw.append(p); actual.append(vals[i])
+        except Exception:
+            continue
+    if len(raw) < 30 or len(set(actual)) < 2:
+        return None, raw, actual
+    iso = IsotonicRegression(out_of_bounds="clip", y_min=0.02, y_max=0.98)
+    iso.fit(np.asarray(raw), np.asarray(actual))
+    return iso, raw, actual
+
+def build_v92_pro(games):
+    games = list(reversed(games))  # engine history is newest-first
+    vals = [_b(g["size"]) for g in games if str(g.get("size","")).lower() in ("big","small")]
+    if len(vals) < V92_MIN_TRAIN:
+        return {"ready":False,"reason":f"need {V92_MIN_TRAIN} rounds","rounds":len(vals),"signal":"SKIP"}
+
+    vals = vals[-V92_WINDOW:]
+    mask, ablation = _ablation_mask(vals)
+    raw_p, components = _raw_v92_probability(vals, mask)
+    iso, wf_raw, wf_y = _walkforward_calibration(vals, mask)
+    p_big = float(iso.predict([raw_p])[0]) if iso is not None else raw_p
+
+    predicted = "big" if p_big >= .5 else "small"
+    conf = p_big if predicted == "big" else 1-p_big
+    regime, choppy = _regime(vals)
+    entropy = _binary_entropy(sum(vals[-20:])/min(20,len(vals)))
+    support = len(wf_y)
+
+    component_votes = [
+        1 if components[0] >= .5 else 0,
+        1 if components[1] >= .5 else 0,
+        1 if components[2] >= .5 else 0,
+    ]
+    target_vote = 1 if predicted == "big" else 0
+    agreement = sum(v == target_vote for v in component_votes)
+
+    threshold = V92_CHOPPY_THRESHOLD if regime == "CHOPPY" else V92_SIGNAL_THRESHOLD
+    reasons = []
+    if conf < threshold: reasons.append("confidence")
+    if entropy > V92_ENTROPY_STOP: reasons.append("entropy")
+    if support < 30: reasons.append("support")
+    if agreement < 2: reasons.append("agreement")
+    signal = "PREDICT" if not reasons else "SKIP"
+
+    # Honest walk-forward signal metrics using the same fixed confidence gates
+    # approximately; calibration is evaluated only on already-observed points.
+    hits = preds = 0
+    if iso is not None:
+        for rp, y in zip(wf_raw, wf_y):
+            cp = float(iso.predict([rp])[0])
+            pc = max(cp,1-cp)
+            if pc >= V92_SIGNAL_THRESHOLD:
+                preds += 1
+                hits += int((cp>=.5) == bool(y))
+    accuracy = (hits/preds) if preds else None
+    coverage = (preds/len(wf_y)) if wf_y else 0.0
 
     return {
-        "ready":False,
-        "reason":"model_refresh_in_progress" if TRAIN_STATE.get("running") else "model_refresh_queued",
-        "issue":expected,
-        "model_version":MODEL_VERSION,
+        "ready": True,
+        "prediction": predicted,
+        "p_big": round(p_big,4),
+        "calibrated_confidence": round(conf,4),
+        "signal": signal,
+        "skip_reasons": reasons,
+        "regime": regime,
+        "choppy_score": round(choppy,4),
+        "entropy": round(entropy,4),
+        "sequence_stability": round(_sequence_stability(vals),4),
+        "agreement": f"{agreement}/3",
+        "support": support,
+        "rolling_oos_accuracy": None if accuracy is None else round(accuracy,4),
+        "rolling_oos_coverage": round(coverage,4),
+        "rolling_oos_predictions": preds,
+        "active_features": [n for n,k in zip(V92_FEATURE_NAMES,mask) if k],
+        "ablation_report": ablation,
+        "components": {
+            "logistic": round(components[0],4),
+            "markov": round(components[1],4),
+            "momentum": round(components[2],4),
+        },
+        "threshold_used": threshold,
+        "model": "V9.2 Pro experimental size engine",
+        "note": "Confidence is walk-forward calibrated when enough support exists; no accuracy guarantee."
     }
 
 
-def _recompute_worker(full_eval=False):
-    requested_full=bool(full_eval)
-    while True:
-        with TRAIN_LOCK:
-            TRAIN_STATE["running"]=True
-            TRAIN_STATE["pending"]=False
-            requested_full = requested_full or bool(TRAIN_STATE.get("pending_full"))
-            TRAIN_STATE["pending_full"]=False
-            TRAIN_STATE["last_started"]=time.time()
-            TRAIN_STATE["last_mode"]="full" if requested_full else "live"
-            TRAIN_STATE["last_error"]=None
+app = FastAPI(
+    title="WinGo Statistical Predictor API",
+    version="9.2.0",
+    lifespan=lifespan,
+)
 
-        try:
-            rounds=load_rounds(HISTORY_LIMIT)
-            if rounds:
-                # Every Nth round gets a full report; otherwise live refresh only.
-                do_full=requested_full or (len(rounds)%FULL_EVAL_EVERY==0)
-                pred=build_v9_prediction(rounds, full_eval=do_full)
-                if pred.get("ready"):
-                    save_prediction_local(pred)
-                    cloud_save_prediction(pred)
-        except Exception as exc:
-            with TRAIN_LOCK:
-                TRAIN_STATE["last_error"]=str(exc)
-        finally:
-            with TRAIN_LOCK:
-                TRAIN_STATE["last_finished"]=time.time()
-                pending=bool(TRAIN_STATE.get("pending"))
-                pending_full=bool(TRAIN_STATE.get("pending_full"))
-                if not pending:
-                    TRAIN_STATE["running"]=False
-                    return
-            requested_full=pending_full
+cors_raw = os.getenv("CORS_ORIGINS", "*").strip()
 
+if cors_raw == "*":
+    allow_origins = ["*"]
+else:
+    allow_origins = [
+        origin.strip()
+        for origin in cors_raw.split(",")
+        if origin.strip()
+    ]
 
-def schedule_recompute(full_eval=False):
-    with TRAIN_LOCK:
-        if TRAIN_STATE.get("running"):
-            TRAIN_STATE["pending"]=True
-            TRAIN_STATE["pending_full"]=bool(TRAIN_STATE.get("pending_full")) or bool(full_eval)
-            return False
-        TRAIN_STATE["running"]=True
-        TRAIN_STATE["pending"]=False
-        TRAIN_STATE["pending_full"]=False
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=allow_origins,
+    allow_credentials=False,
+    allow_methods=["GET", "POST"],
+    allow_headers=["*"],
+)
 
-    t=threading.Thread(target=_recompute_worker,args=(bool(full_eval),),daemon=True,name="v9-model-refresh")
-    t.start()
-    return True
-
-def live_accuracy():
-    p=[x for x in load_predictions(500) if int(x.get("verified") or 0)==1]; q=[x for x in p if x.get("signal")=="PREDICT"]
-    def s(a):
-        n=len(a);w=sum(1 for x in a if int(x.get("size_win") or 0)==1);return {"tested":n,"correct":w,"accuracy":w/n if n else None}
-    return {"all_verified":s(p),"predict_only":s(q),"coverage":len(q)/len(p) if p else None}
-
-
-class RoundInput(BaseModel):
-    issue:str; number:int; color:str; secret:str
-
-app=FastAPI(title="WinGo V9 Research Engine",version=APP_VERSION)
-app.add_middleware(CORSMiddleware,allow_origins=CORS_LIST,allow_credentials=False,allow_methods=["GET","POST","OPTIONS"],allow_headers=["*"])
-
-@app.on_event("startup")
-def startup():
-    init_db()
-    if round_count()==0:
-        hydrate_from_firestore()
-    # Never block app startup on ML/backtesting.
-    schedule_recompute(full_eval=True)
 
 @app.get("/")
 def root():
     return {
-        "service":"online",
-        "version":APP_VERSION,
-        "model_version":MODEL_VERSION,
-        "purpose":"research/backtesting",
-        "target":"big_small",
-        "model_refresh":dict(TRAIN_STATE),
+        "name": "WinGo Statistical Predictor API",
+        "version": "9.2.0",
+        "status": "online",
+        "docs": "/docs",
     }
+
 
 @app.get("/health")
 def health():
-    return {
-        "service":"online",
-        "version":APP_VERSION,
-        "stored_rounds":round_count(),
-        "history_limit":HISTORY_LIMIT,
-        "live_train_limit":LIVE_TRAIN_LIMIT,
-        "minimum_train":MIN_TRAIN,
-        "embargo":EMBARGO,
-        "signal_threshold":SIGNAL_THRESHOLD,
-        "full_eval_every":FULL_EVAL_EVERY,
-        "firestore_enabled":bool(FIREBASE_PROJECT_ID and GOOGLE_APPLICATION_CREDENTIALS),
-        "model_refresh":dict(TRAIN_STATE),
-    }
+    return engine.status()
 
-@app.get("/api/memory")
-def memory():
-    p=psutil.Process(os.getpid());m=p.memory_info()
-    return {
-        "rss_mb":round(m.rss/1048576,2),
-        "vms_mb":round(m.vms/1048576,2),
-        "threads":p.num_threads(),
-        "history_limit":HISTORY_LIMIT,
-        "live_train_limit":LIVE_TRAIN_LIMIT,
-        "firestore_transport":"REST",
-        "model_refresh":dict(TRAIN_STATE),
-    }
-
-@app.get("/api/history")
-def history(limit:int=100):
-    r=load_rounds(max(1,min(limit,500)));r.reverse();return {"rounds":r,"count":len(r)}
-
-@app.get("/api/predictions")
-def predictions(limit:int=100):
-    r=load_predictions(max(1,min(limit,500)));return {"predictions":r,"count":len(r)}
-
-@app.get("/api/backtest")
-def backtest(refresh:bool=False):
-    if refresh:
-        schedule_recompute(full_eval=True)
-    return {
-        "model_version":MODEL_VERSION,
-        "walk_forward":MODEL_CACHE.get("report"),
-        "ablation":MODEL_CACHE.get("ablation"),
-        "model_refresh":dict(TRAIN_STATE),
-    }
 
 @app.get("/api/dashboard")
 def dashboard():
-    # Dashboard must always be cheap and responsive. It never trains synchronously.
-    r=load_rounds(HISTORY_LIMIT)
-    pred=latest_saved_prediction_for(r)
-    if r and (MODEL_CACHE.get("history_issue") != r[-1]["issue"]):
-        schedule_recompute(full_eval=False)
     return {
-        "version":APP_VERSION,
-        "model_version":MODEL_VERSION,
-        "latest_round":r[-1] if r else None,
-        "prediction":pred,
-        "accuracy":live_accuracy(),
-        "walk_forward":MODEL_CACHE.get("report"),
-        "ablation":MODEL_CACHE.get("ablation"),
-        "recent_rounds":list(reversed(r[-30:])),
-        "recent_predictions":load_predictions(30),
-        "model_refresh":dict(TRAIN_STATE),
-        "status":{
-            "stored_rounds":len(r),
-            "history_limit":HISTORY_LIMIT,
-            "live_train_limit":LIVE_TRAIN_LIMIT,
-            "minimum_train":MIN_TRAIN,
-            "signal_threshold":SIGNAL_THRESHOLD,
-            "firestore_enabled":bool(FIREBASE_PROJECT_ID and GOOGLE_APPLICATION_CREDENTIALS),
-        },
+        "status": engine.status(),
+        "latest_round": engine.get_latest_round(),
+        "latest_prediction": engine.get_latest_prediction(),
+        "accuracy": engine.accuracy_stats(200),
+        "history": engine.recent_rounds(20),
+        "predictions": engine.recent_predictions(20),
     }
+
+
+@app.get("/api/history")
+def history(limit: int = 30):
+    return {
+        "items": engine.recent_rounds(limit),
+    }
+
+
+@app.get("/api/predictions")
+def predictions(limit: int = 30):
+    return {
+        "items": engine.recent_predictions(limit),
+    }
+
+
+@app.get("/api/stats")
+def stats(window: int = 200):
+    return engine.accuracy_stats(window)
+
+
+INGEST_SECRET = os.getenv("INGEST_SECRET", "")
+
+class RoundInput(BaseModel):
+    issue: str
+    number: int
+    color: str
+    secret: str
+
+
+@app.get("/api/v9.2/pro")
+def v92_pro():
+    history = engine.load_history(HISTORY_LIMIT)
+    return build_v92_pro(history)
+
 
 @app.post("/api/ingest")
-def ingest(item:RoundInput):
-    # Intentionally returns quickly. ML/backtesting is queued after persistence.
-    if not INGEST_SECRET or item.secret!=INGEST_SECRET:
-        return {"ok":False,"error":"Unauthorized"}
+def ingest_round(round_data: RoundInput):
+    if not INGEST_SECRET or round_data.secret != INGEST_SECRET:
+        return {"ok": False, "error": "Unauthorized"}
 
-    issue=str(item.issue).strip();n=int(item.number);color=normalize_color(item.color)
-    if not issue:return {"ok":False,"error":"Missing issue"}
-    if not 0<=n<=9:return {"ok":False,"error":"Number must be 0..9"}
-    if color not in {"red","green","violet"}:return {"ok":False,"error":"Invalid color"}
+    color = engine.parse_color(round_data.color)
+    if color is None:
+        return {"ok": False, "error": "Invalid color"}
 
-    rr=rp=0;re=None
-    if round_count()==0:
-        rr,rp,re=hydrate_from_firestore()
+    number = int(round_data.number)
+    if number < 0 or number > 9:
+        return {"ok": False, "error": "Invalid number"}
 
-    inserted=save_round_local(issue,n,color)
-    cre=cloud_save_round({"issue":issue,"number":n,"color":color,"seen_at":time.time()}) if inserted else None
-
-    ver=verify_prediction(issue,size_from_number(n))
-    cve=cloud_save_prediction(ver) if ver else None
-
-    queued=False
-    if inserted:
-        queued=schedule_recompute(full_eval=False)
-
-    current_rounds=load_rounds(2)
-    current_prediction=latest_saved_prediction_for(current_rounds) if current_rounds else None
-
-    return {
-        "ok":True,
-        "inserted":inserted,
-        "issue":issue,
-        "stored_rounds":round_count(),
-        "restored_rounds":rr,
-        "restored_predictions":rp,
-        "restore_error":re,
-        "verified_prediction":ver,
-        "prediction":current_prediction,
-        "model_refresh_queued":queued or bool(TRAIN_STATE.get("running")),
-        "cloud_errors":{
-            "round":cre,
-            "verified_prediction":cve,
-        },
+    game = {
+        "issue": str(round_data.issue),
+        "number": number,
+        "color": color,
+        "size": "big" if number >= 5 else "small",
+        "parity": "even" if number % 2 == 0 else "odd",
     }
 
+    inserted = engine.save_round(game)
+    engine.verify_pending_predictions()
+    history = engine.load_history(HISTORY_LIMIT)
+    prediction = engine.save_next_prediction(history) if inserted else None
+
+    return {
+        "ok": True,
+        "inserted": inserted,
+        "round": game,
+        "stored_rounds": engine.count_rounds(),
+        "prediction": prediction,
+    }

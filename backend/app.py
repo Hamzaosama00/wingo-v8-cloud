@@ -608,7 +608,7 @@ class PredictorEngine:
         streak, streak_length = self.streak_distribution(sequence, states)
         context, context_support = self.context_distribution(games, feature, states)
 
-                weights = self.regime_weights(
+        weights = self.regime_weights(
             volatility=vol,
             markov_support=markov_support,
             pattern_support=pattern_support,
@@ -710,9 +710,13 @@ class PredictorEngine:
             "pattern_support": pattern_support,
             "pattern_order": pattern_order,
             "streak_length": streak_length,
+            "gap_current": self.gap_since_previous_same(sequence),
             "total_support": markov_support + pattern_support,
-            }
-            # ---------------------------------------------------------
+            "volatility": vol,
+            "regime": self.regime_from_volatility(vol),
+        }
+
+    # ---------------------------------------------------------
     # V7 number-first adaptive model
     # ---------------------------------------------------------
 
@@ -728,38 +732,19 @@ class PredictorEngine:
         parity = "even" if number % 2 == 0 else "odd"
         return color, size, parity
 
-    def frequency_number_distribution(
-        self,
-        sequence: Sequence[int],
-        window: int = 100,
-    ) -> Dict[int, float]:
+    def frequency_number_distribution(self, sequence: Sequence[int], window: int = 100) -> Dict[int, float]:
         scores = {n: 1.0 for n in NUMBER_STATES}
-
         for value in list(sequence)[-window:]:
             if value in scores:
                 scores[value] += 1.0
-
         return self.normalize(scores, NUMBER_STATES)
 
-    def candidate_number_distributions(
-        self,
-        sequence: Sequence[int],
-    ) -> Dict[str, Dict[int, float]]:
+    def candidate_number_distributions(self, sequence: Sequence[int]) -> Dict[str, Dict[int, float]]:
         ema = self.ema_distribution(sequence, NUMBER_STATES)
         markov, _ = self.markov_distribution(sequence, NUMBER_STATES)
-        pattern, _, _ = self.ngram_distribution(
-            sequence,
-            NUMBER_STATES,
-            max_order=3,
-        )
+        pattern, _, _ = self.ngram_distribution(sequence, NUMBER_STATES, max_order=3)
         freq = self.frequency_number_distribution(sequence)
-
-        return {
-            "ema": ema,
-            "markov": markov,
-            "pattern": pattern,
-            "frequency": freq,
-        }
+        return {"ema": ema, "markov": markov, "pattern": pattern, "frequency": freq}
 
     def walk_forward_model_scores(
         self,
@@ -768,57 +753,31 @@ class PredictorEngine:
         min_train: int = 30,
     ) -> Dict[str, Dict[str, float]]:
         names = ("ema", "markov", "pattern", "frequency")
-
-        stats = {
-            name: {
-                "correct": 0.0,
-                "tested": 0.0,
-                "logloss": 0.0,
-            }
-            for name in names
-        }
+        stats = {name: {"correct": 0.0, "tested": 0.0, "logloss": 0.0} for name in names}
 
         start = max(min_train, len(sequence) - lookback)
-
         for target_index in range(start, len(sequence)):
             train = list(sequence[:target_index])
             actual = int(sequence[target_index])
-
             candidates = self.candidate_number_distributions(train)
 
             for name, dist in candidates.items():
                 predicted = max(dist, key=dist.get)
-
                 stats[name]["tested"] += 1.0
                 stats[name]["correct"] += float(predicted == actual)
-
-                stats[name]["logloss"] += -math.log(
-                    max(float(dist.get(actual, 0.0)), 1e-9)
-                )
+                stats[name]["logloss"] += -math.log(max(float(dist.get(actual, 0.0)), 1e-9))
 
         for name in names:
             tested = stats[name]["tested"]
-
             if tested:
-                stats[name]["accuracy"] = (
-                    stats[name]["correct"] / tested
-                )
+                stats[name]["accuracy"] = stats[name]["correct"] / tested
                 stats[name]["logloss"] /= tested
-
             else:
                 stats[name]["accuracy"] = 0.10
                 stats[name]["logloss"] = math.log(10.0)
-
         return stats
 
-    def adaptive_number_weights(
-        self,
-        sequence: Sequence[int],
-    ) -> Tuple[
-        Dict[str, float],
-        Dict[str, Dict[str, float]],
-    ]:
-            def adaptive_number_weights(self, sequence: Sequence[int]) -> Tuple[Dict[str, float], Dict[str, Dict[str, float]]]:
+    def adaptive_number_weights(self, sequence: Sequence[int]) -> Tuple[Dict[str, float], Dict[str, Dict[str, float]]]:
         stats = self.walk_forward_model_scores(sequence)
         raw = {}
 
@@ -1457,12 +1416,507 @@ def _v93_ngram_probability(vals, order=3):
     ctx = tuple(vals[-order:])
     big = small = 1.0
     support = 0
-        for i in range(order, len(vals)):
+    for i in range(order, len(vals)):
         if tuple(vals[i-order:i]) == ctx:
             support += 1
             if vals[i] == 1:
-                big += 1.0
+                big += 1
             else:
-                small += 1.0
+                small += 1
+    return float(big/(big+small)), support
 
-    return float(big / (big + small)), support
+def _v93_trend_model(vals):
+    """Trend follower: short/medium EMA + recent momentum."""
+    ema3 = _v93_ema(vals[-30:], 3)
+    ema8 = _v93_ema(vals[-50:], 8)
+    ema20 = _v93_ema(vals[-80:], 20)
+    momentum = (ema3 - ema20)
+    slope = (ema8 - ema20)
+    score = 0.5 + 0.75*momentum + 0.35*slope
+    return _v93_clip(score)
+
+def _v93_reversion_model(vals):
+    """Reversionist: recent imbalance + gap pressure as a hypothesis feature.
+    It does not assume the process must revert; walk-forward calibration decides
+    whether this heuristic deserves confidence.
+    """
+    if len(vals) < 20:
+        return 0.5
+    r10 = sum(vals[-10:]) / 10.0
+    r30 = sum(vals[-30:]) / min(30, len(vals))
+    gap_big = min(_v93_gap_since(vals, 1), 12) / 12.0
+    gap_small = min(_v93_gap_since(vals, 0), 12) / 12.0
+    gap_to_mean = 0.5 - r10
+    # Positive -> Big reversion hypothesis, negative -> Small.
+    score = 0.5 + 0.55*gap_to_mean + 0.18*(0.5-r30) + 0.12*(gap_big-gap_small)
+    return _v93_clip(score)
+
+def _v93_pattern_model(vals):
+    """Pattern matcher: first-order Markov + 2/3-gram context."""
+    tm = _v93_transition_matrix(vals, 60)
+    markov = tm[int(vals[-1])][1] if vals else 0.5
+    p2, s2 = _v93_ngram_probability(vals, 2)
+    p3, s3 = _v93_ngram_probability(vals, 3)
+    # Context gets more weight only when repeated support exists.
+    w3 = min(s3/10.0, 1.0)
+    w2 = min(s2/15.0, 1.0)
+    denom = 1.0 + 0.8*w2 + 1.0*w3
+    p = (markov + 0.8*w2*p2 + 1.0*w3*p3) / denom
+    return _v93_clip(p), {"markov": markov, "ngram2_support": s2, "ngram3_support": s3}
+
+def _v93_raw_ensemble(vals):
+    trend = _v93_trend_model(vals)
+    revert = _v93_reversion_model(vals)
+    pattern, pmeta = _v93_pattern_model(vals)
+    regime, _ = _v93_regime(vals)
+
+    # Diversified equal-weight base. In CHOPPY conditions, pattern matching gets
+    # a little more weight, but permission to predict is handled separately.
+    if regime == "CHOPPY":
+        raw = 0.25*trend + 0.25*revert + 0.50*pattern
+    else:
+        raw = (trend + revert + pattern) / 3.0
+
+    votes = [
+        1 if trend >= 0.5 else 0,
+        1 if revert >= 0.5 else 0,
+        1 if pattern >= 0.5 else 0,
+    ]
+    return _v93_clip(raw), (trend, revert, pattern), votes, pmeta
+
+def _v93_walkforward(vals):
+    raw, actual = [], []
+    first = max(V93_MIN_TRAIN, len(vals)-120)
+    for i in range(first, len(vals)):
+        tr = vals[max(0, i-V93_WINDOW):i]
+        if len(tr) < V93_MIN_TRAIN:
+            continue
+        try:
+            p, _, _, _ = _v93_raw_ensemble(tr)
+            raw.append(p)
+            actual.append(vals[i])
+        except Exception:
+            continue
+    iso = None
+    if len(raw) >= 30 and len(set(actual)) >= 2:
+        iso = IsotonicRegression(out_of_bounds="clip", y_min=0.02, y_max=0.98)
+        iso.fit(np.asarray(raw), np.asarray(actual))
+    return iso, raw, actual
+
+def build_v93_flash(games):
+    games = list(reversed(games))
+    vals = [_v93_b(g["size"]) for g in games if str(g.get("size","")).lower() in ("big","small")]
+    if len(vals) < V93_MIN_TRAIN:
+        return {
+            "ready": False,
+            "reason": f"need {V93_MIN_TRAIN} rounds",
+            "rounds": len(vals),
+            "signal": "SKIP",
+            "model": "V9.4.1 Flash"
+        }
+
+    vals = vals[-V93_WINDOW:]
+    raw_p, components, votes, pmeta = _v93_raw_ensemble(vals)
+    iso, wf_raw, wf_y = _v93_walkforward(vals)
+    # V9.4: calibration is support-aware. Small calibration samples must not
+    # flatten the model into a permanent ~54-56% SMALL output.
+    calibrated_p = float(iso.predict([raw_p])[0]) if iso is not None else raw_p
+    calibration_weight = 0.0
+    if iso is not None:
+        calibration_weight = float(np.clip((len(wf_y) - 30) / 70.0, 0.0, 1.0))
+    p_big = float((1.0 - calibration_weight) * raw_p + calibration_weight * calibrated_p)
+    p_big = _v93_clip(p_big)
+
+    predicted_big = p_big >= 0.5
+    predicted = "big" if predicted_big else "small"
+    conf = p_big if predicted_big else 1-p_big
+
+    regime, choppy_score = _v93_regime(vals)
+    entropy20 = _v93_binary_entropy(sum(vals[-20:])/min(20, len(vals)))
+    transition_entropy = _v93_transition_entropy(vals[-30:])
+    switch_rate = _v93_switch_rate(vals[-20:])
+    stability = _v93_sequence_stability(vals)
+
+    agreement = sum((v == 1) == predicted_big for v in votes)
+    threshold = V93_CHOPPY_THRESHOLD if regime == "CHOPPY" else V93_STABLE_THRESHOLD
+
+    reasons = []
+    if conf < threshold:
+        reasons.append("confidence")
+    if entropy20 > V93_ENTROPY_STOP:
+        reasons.append("entropy")
+    if switch_rate > V93_SWITCH_RATE_STOP:
+        reasons.append("volatility")
+    if len(wf_y) < 30:
+        reasons.append("support")
+    if agreement < V93_MIN_AGREEMENT:
+        reasons.append("agreement")
+
+    signal = "PREDICT" if not reasons else "SKIP"
+
+    # Honest historical coverage/accuracy estimate using the same strict base threshold.
+    hits = preds = 0
+    if iso is not None:
+        for rp, y in zip(wf_raw, wf_y):
+            cp = float(iso.predict([rp])[0])
+            pc = max(cp, 1-cp)
+            if pc >= V93_STABLE_THRESHOLD:
+                preds += 1
+                hits += int((cp >= 0.5) == bool(y))
+    oos_acc = (hits/preds) if preds else None
+    coverage = (preds/len(wf_y)) if wf_y else 0.0
+
+    return {
+        "ready": True,
+        "model": "V9.4.1 Flash",
+        "prediction": predicted,
+        "decision": predicted.upper() if signal == "PREDICT" else "NO EDGE",
+        "raw_p_big": round(raw_p, 4),
+        "p_big": round(p_big, 4),
+        "calibration_weight": round(calibration_weight, 4),
+        "calibration_support": len(wf_y),
+        "calibrated_confidence": round(conf, 4),
+        "signal": signal,
+        "skip_reasons": reasons,
+        "regime": regime,
+        "threshold_used": threshold,
+        "choppy_score": round(choppy_score, 4),
+        "entropy20": round(entropy20, 4),
+        "transition_entropy": round(transition_entropy, 4),
+        "switch_rate": round(switch_rate, 4),
+        "sequence_stability": round(stability, 4),
+        "agreement": f"{agreement}/3",
+        "support": len(wf_y),
+        "rolling_oos_accuracy": None if oos_acc is None else round(oos_acc, 4),
+        "rolling_oos_coverage": round(coverage, 4),
+        "rolling_oos_predictions": preds,
+        "components": {
+            "trend_follower": round(components[0], 4),
+            "reversionist": round(components[1], 4),
+            "pattern_matcher": round(components[2], 4),
+        },
+        "pattern_meta": {
+            "markov": round(float(pmeta["markov"]), 4),
+            "ngram2_support": int(pmeta["ngram2_support"]),
+            "ngram3_support": int(pmeta["ngram3_support"]),
+        },
+        "features": {
+            "ema3": round(_v93_ema(vals[-30:], 3), 4),
+            "ema8": round(_v93_ema(vals[-50:], 8), 4),
+            "ema20": round(_v93_ema(vals[-80:], 20), 4),
+            "gap_since_big": int(_v93_gap_since(vals, 1)),
+            "gap_since_small": int(_v93_gap_since(vals, 0)),
+            "gap_to_mean_10": round(0.5 - sum(vals[-10:])/10.0, 4),
+        },
+        "note": "V9.4 research signal. Direction is available from 10 completed rounds; NO EDGE/SKIP remains possible when evidence is weak. Confidence is support-aware and is not a guaranteed probability."
+    }
+
+
+
+# ============================================================
+# V9.3 VIRTUAL PKR SIMULATOR
+# Historical/backtest only. No live bet placement or wallet integration.
+# ============================================================
+
+def simulate_v93_virtual_balance(
+    games,
+    starting_balance: float,
+    target_balance: float,
+    stake_percent: float = 0.02,
+    max_rounds: int = 200,
+):
+    starting_balance = float(max(starting_balance, 1.0))
+    target_balance = float(max(target_balance, starting_balance))
+    stake_percent = float(np.clip(stake_percent, 0.001, 0.05))
+    max_rounds = int(np.clip(max_rounds, 1, 1000))
+
+    ordered = list(reversed(games))
+    usable = [g for g in ordered if str(g.get("size","")).lower() in ("big","small")]
+    if len(usable) < V93_MIN_TRAIN + 1:
+        return {
+            "ready": False,
+            "reason": f"need at least {V93_MIN_TRAIN + 1} completed rounds",
+            "starting_balance_pkr": round(starting_balance, 2),
+            "target_balance_pkr": round(target_balance, 2),
+        }
+
+    balance = starting_balance
+    peak = balance
+    lowest = balance
+    start_i = max(V93_MIN_TRAIN, len(usable) - max_rounds)
+    rows = []
+    predictions = wins = losses = skips = 0
+    stop_reason = "history_exhausted"
+
+    for i in range(start_i, len(usable)):
+        # Only information available before this historical round is used.
+        train_games = list(reversed(usable[:i]))
+        result = build_v93_flash(train_games)
+        actual = str(usable[i]["size"]).lower()
+
+        if not result.get("ready") or result.get("signal") != "PREDICT":
+            skips += 1
+            rows.append({
+                "issue": str(usable[i].get("issue","")),
+                "action": "SKIP",
+                "actual": actual,
+                "balance_pkr": round(balance, 2),
+            })
+            continue
+
+        prediction = str(result["prediction"]).lower()
+        confidence = float(result.get("calibrated_confidence", 0.5))
+
+        # Virtual fixed-fraction stake. This is deliberately capped and does
+        # not use Kelly/Martingale or any live-wallet logic.
+        virtual_stake = min(balance * stake_percent, max(balance, 0.0))
+        won = prediction == actual
+
+        if won:
+            balance += virtual_stake
+            wins += 1
+        else:
+            balance -= virtual_stake
+            losses += 1
+        predictions += 1
+
+        peak = max(peak, balance)
+        lowest = min(lowest, balance)
+
+        rows.append({
+            "issue": str(usable[i].get("issue","")),
+            "prediction": prediction,
+            "actual": actual,
+            "confidence": round(confidence, 4),
+            "virtual_stake_pkr": round(virtual_stake, 2),
+            "result": "WIN" if won else "LOSS",
+            "balance_pkr": round(balance, 2),
+        })
+
+        if balance >= target_balance:
+            stop_reason = "target_reached"
+            break
+        if balance <= 0.01:
+            balance = 0.0
+            stop_reason = "virtual_balance_depleted"
+            break
+
+    hit_rate = (wins / predictions) if predictions else None
+    pnl = balance - starting_balance
+    return {
+        "ready": True,
+        "mode": "historical_virtual_simulation_only",
+        "currency": "PKR",
+        "starting_balance_pkr": round(starting_balance, 2),
+        "target_balance_pkr": round(target_balance, 2),
+        "ending_balance_pkr": round(balance, 2),
+        "max_balance_reached_pkr": round(peak, 2),
+        "min_balance_reached_pkr": round(lowest, 2),
+        "profit_loss_pkr": round(pnl, 2),
+        "return_percent": round((pnl / starting_balance) * 100.0, 2),
+        "virtual_stake_percent": round(stake_percent * 100.0, 2),
+        "predictions": predictions,
+        "wins": wins,
+        "losses": losses,
+        "skips": skips,
+        "hit_rate": None if hit_rate is None else round(hit_rate, 4),
+        "stop_reason": stop_reason,
+        "rounds_processed": len(rows),
+        "history": rows[-250:],
+        "note": "Backtest with virtual PKR only. It does not place bets or control a real wallet."
+    }
+
+
+app = FastAPI(
+    title="WinGo Statistical Predictor API",
+    version="9.4.0",
+    lifespan=lifespan,
+)
+
+cors_raw = os.getenv("CORS_ORIGINS", "*").strip()
+
+if cors_raw == "*":
+    allow_origins = ["*"]
+else:
+    allow_origins = [
+        origin.strip()
+        for origin in cors_raw.split(",")
+        if origin.strip()
+    ]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=allow_origins,
+    allow_credentials=False,
+    allow_methods=["GET", "POST"],
+    allow_headers=["*"],
+)
+
+
+@app.get("/")
+def root():
+    return {
+        "name": "WinGo Statistical Predictor API",
+        "version": "9.3.0",
+        "status": "online",
+        "docs": "/docs",
+    }
+
+
+@app.get("/health")
+def health():
+    return engine.status()
+
+
+@app.get("/api/dashboard")
+def dashboard():
+    return {
+        "status": engine.status(),
+        "latest_round": engine.get_latest_round(),
+        "latest_prediction": engine.get_latest_prediction(),
+        "accuracy": engine.accuracy_stats(200),
+        "history": engine.recent_rounds(20),
+        "predictions": engine.recent_predictions(20),
+    }
+
+
+@app.get("/api/history")
+def history(limit: int = 30):
+    return {
+        "items": engine.recent_rounds(limit),
+    }
+
+
+@app.get("/api/predictions")
+def predictions(limit: int = 30):
+    return {
+        "items": engine.recent_predictions(limit),
+    }
+
+
+@app.get("/api/stats")
+def stats(window: int = 200):
+    return engine.accuracy_stats(window)
+
+
+INGEST_SECRET = os.getenv("INGEST_SECRET", "")
+
+class RoundInput(BaseModel):
+    issue: str
+    number: int
+    color: str
+    secret: str
+
+
+@app.get("/api/v9.4/flash")
+@app.get("/api/v9.3/flash")
+def v93_flash():
+    history = engine.load_history(HISTORY_LIMIT)
+    return build_v93_flash(history)
+
+
+@app.get("/api/v9.4/simulate")
+@app.get("/api/v9.3/simulate")
+def v93_simulate(
+    starting_balance: float = Query(..., gt=0, le=100000000),
+    target_balance: float = Query(..., gt=0, le=1000000000),
+    stake_percent: float = Query(2.0, ge=0.1, le=5.0),
+    max_rounds: int = Query(200, ge=10, le=1000),
+):
+    history = engine.load_history(max(HISTORY_LIMIT, max_rounds + V93_MIN_TRAIN + 20))
+    return simulate_v93_virtual_balance(
+        history,
+        starting_balance=starting_balance,
+        target_balance=target_balance,
+        stake_percent=stake_percent / 100.0,
+        max_rounds=max_rounds,
+    )
+
+
+@app.post("/api/ingest")
+def ingest_round(round_data: RoundInput):
+    if not INGEST_SECRET or round_data.secret != INGEST_SECRET:
+        return {"ok": False, "error": "Unauthorized"}
+
+    color = engine.parse_color(round_data.color)
+    if color is None:
+        return {"ok": False, "error": "Invalid color"}
+
+    number = int(round_data.number)
+    if number < 0 or number > 9:
+        return {"ok": False, "error": "Invalid number"}
+
+    game = {
+        "issue": str(round_data.issue),
+        "number": number,
+        "color": color,
+        "size": "big" if number >= 5 else "small",
+        "parity": "even" if number % 2 == 0 else "odd",
+    }
+
+    restored_from_firestore = 0
+
+
+    firebase_error = None
+
+
+    try:
+
+
+        # New Render deploys start with an empty ephemeral disk.
+
+
+        # Rebuild the cache BEFORE inserting/predicting.
+
+
+        if engine.count_rounds() == 0:
+
+
+            restored_from_firestore = engine.hydrate_rounds_firestore(HISTORY_LIMIT)
+
+
+    except Exception as exc:
+
+
+        firebase_error = f"hydrate: {type(exc).__name__}: {exc}"
+
+
+
+    inserted = engine.save_round(game)
+
+
+
+    try:
+
+
+        # Firestore is the permanent source of truth across deployments.
+
+
+        engine.persist_round_firestore(game)
+
+
+    except Exception as exc:
+
+
+        firebase_error = f"persist: {type(exc).__name__}: {exc}"
+
+
+
+    engine.verify_pending_predictions()
+
+
+    history = engine.load_history(HISTORY_LIMIT)
+
+
+    prediction = engine.save_next_prediction(history) if inserted else None
+
+    return {
+        "ok": True,
+        "inserted": inserted,
+        "round": game,
+        "stored_rounds": engine.count_rounds(),
+        "prediction": prediction,
+        "restored_from_firestore": restored_from_firestore,
+        "firebase_error": firebase_error,
+        "storage": "firestore-persistent/sqlite-cache",
+    }

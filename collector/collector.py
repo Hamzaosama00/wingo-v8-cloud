@@ -1,6 +1,16 @@
+import asyncio
+import logging
 import os
 import time
-import requests
+
+import httpx
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
+logger = logging.getLogger("wingo.collector")
+logging.getLogger("httpx").setLevel(os.getenv("HTTPX_LOG_LEVEL", "WARNING").upper())
 
 API = os.getenv(
     "SOURCE_API",
@@ -22,10 +32,6 @@ H = {
     "Referer": "https://www.92pak8.com/",
 }
 
-source = requests.Session()
-source.headers.update(H)
-backend = requests.Session()
-
 seen = set()
 last_backend_count = None
 
@@ -35,7 +41,7 @@ def key(x):
     except Exception:
         return 0
 
-def post_round(x):
+async def post_round(x, backend: httpx.AsyncClient):
     global last_backend_count, seen
 
     issue = str(x.get("issueNumber", ""))
@@ -47,18 +53,17 @@ def post_round(x):
 
     for attempt in range(1, 6):
         try:
-            q = backend.post(
+            q = await backend.post(
                 BACKEND + "/api/ingest",
                 json=body,
                 headers={"X-Ingest-Secret": SECRET},
-                timeout=30,
             )
             if q.status_code in (401, 403):
                 raise SystemExit(
                     "Collector authentication failed. Check that INGEST_SECRET matches the backend."
                 )
             if 400 <= q.status_code < 500 and q.status_code not in (408, 429):
-                print(f"[REJECTED] {issue} HTTP {q.status_code}: {q.text[:200]}")
+                logger.error("rejected issue=%s HTTP %s: %s", issue, q.status_code, q.text[:200])
                 seen.add(issue)
                 return True
             q.raise_for_status()
@@ -79,9 +84,11 @@ def post_round(x):
             )
 
             if reset:
-                print(
-                    f"[BACKEND RESTART] stored {last_backend_count} -> {count}; "
-                    f"backend cache reset detected; replaying recent {N} rounds as fallback"
+                logger.warning(
+                    "backend restart stored=%s -> %s; replaying recent %s rounds",
+                    last_backend_count,
+                    count,
+                    N,
                 )
                 # Force the current source page to be replayed on the next loop.
                 # Backend deduplication makes this safe.
@@ -90,16 +97,22 @@ def post_round(x):
             last_backend_count = max(count, last_backend_count or 0) if not reset else count
             seen.add(issue)
 
-            extra = f" restored={restored}" if restored else ""
-            print(f"[OK] {issue} backend={count}{extra}")
+            logger.info("ingested issue=%s backend=%s restored=%s", issue, count, restored)
             return True
 
         except Exception as e:
             wait = min(3 * attempt, 15)
-            print(f"[RETRY] {issue} {attempt}/5 {type(e).__name__}: {e} wait={wait}s")
-            time.sleep(wait)
+            logger.warning(
+                "retry issue=%s attempt=%s/5 error=%s: %s wait=%ss",
+                issue,
+                attempt,
+                type(e).__name__,
+                e,
+                wait,
+            )
+            await asyncio.sleep(wait)
 
-    print(f"[FAILED] {issue} - will retry from backfill window")
+    logger.error("failed issue=%s; will retry from backfill window", issue)
     return False
 
 def validate_config():
@@ -111,15 +124,14 @@ def validate_config():
         raise SystemExit("INGEST_SECRET is required")
 
 
-def poll_once():
-    r = source.get(
+async def poll_once(source: httpx.AsyncClient, backend: httpx.AsyncClient):
+    r = await source.get(
         API,
         params={
             "pageNo": 1,
             "pageSize": N,
             "ts": int(time.time() * 1000),
         },
-        timeout=15,
     )
     r.raise_for_status()
     payload = r.json()
@@ -139,15 +151,15 @@ def poll_once():
         try:
             number = int(x.get("number"))
         except (TypeError, ValueError):
-            print(f"[SKIP] {issue} invalid number")
+            logger.warning("skip issue=%s invalid number", issue)
             seen.add(issue)
             continue
         if number < 0 or number > 9:
-            print(f"[SKIP] {issue} number out of range")
+            logger.warning("skip issue=%s number out of range", issue)
             seen.add(issue)
             continue
 
-        if not post_round(x):
+        if not await post_round(x, backend):
             # Keep ordering. Next poll will retry this round first.
             break
 
@@ -161,19 +173,27 @@ def poll_once():
         seen.update(newest)
 
 
-def main():
+async def run_collector():
     validate_config()
-    print(f"WinGo V9.5.1 collector -> {BACKEND}")
-    print(f"Recovery/backfill window: {N} rounds")
+    logger.info("WinGo V9.5.1 collector -> %s", BACKEND)
+    logger.info("recovery/backfill window=%s rounds", N)
 
-    while True:
-        try:
-            poll_once()
-        except SystemExit:
-            raise
-        except Exception as e:
-            print("[SOURCE ERROR]", type(e).__name__, e)
-        time.sleep(POLL)
+    async with (
+        httpx.AsyncClient(headers=H, timeout=15.0, follow_redirects=True) as source,
+        httpx.AsyncClient(timeout=30.0, follow_redirects=True) as backend,
+    ):
+        while True:
+            try:
+                await poll_once(source, backend)
+            except SystemExit:
+                raise
+            except Exception as exc:
+                logger.error("source error %s: %s", type(exc).__name__, exc)
+            await asyncio.sleep(POLL)
+
+
+def main():
+    asyncio.run(run_collector())
 
 
 if __name__ == "__main__":

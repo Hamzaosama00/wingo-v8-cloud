@@ -1,3 +1,4 @@
+import logging
 import math
 import os
 import secrets
@@ -6,10 +7,11 @@ import threading
 import time
 from collections import defaultdict
 from contextlib import asynccontextmanager
-from typing import Any, Dict, Hashable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Hashable, List, Literal, Optional, Sequence, Tuple
 
-import requests
+import aiosqlite
 import firebase_admin
+import httpx
 from firebase_admin import credentials, firestore
 import numpy as np
 from sklearn.isotonic import IsotonicRegression
@@ -17,7 +19,35 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
+logger = logging.getLogger("wingo.backend")
+logging.getLogger("httpx").setLevel(os.getenv("HTTPX_LOG_LEVEL", "WARNING").upper())
+
+MATH_EPSILON = max(float(os.getenv("MATH_EPSILON", "1e-12")), 1e-15)
+
+
+def safe_divide(numerator: float, denominator: float, default: float = 0.0) -> float:
+    """Divide finite model values without allowing a zero denominator."""
+    denominator = float(denominator)
+    if not math.isfinite(denominator) or abs(denominator) <= MATH_EPSILON:
+        return float(default)
+    value = float(numerator) / denominator
+    return value if math.isfinite(value) else float(default)
+
+
+def safe_probability(value: float) -> float:
+    return min(max(float(value), MATH_EPSILON), 1.0 - MATH_EPSILON)
+
+
+def safe_negative_log_probability(value: float) -> float:
+    return -math.log(safe_probability(value))
 
 
 HISTORY_URL = os.getenv(
@@ -35,6 +65,10 @@ BACKFILL_PAGE_SIZE = int(os.getenv("BACKFILL_PAGE_SIZE", "100"))
 POLL_SECONDS = float(os.getenv("POLL_SECONDS", "3"))
 MIN_HISTORY = int(os.getenv("MIN_HISTORY", "50"))
 NUMBER_STATES = list(range(10))
+ENABLE_INTERNAL_COLLECTOR = os.getenv("ENABLE_INTERNAL_COLLECTOR", "true").strip().lower() in {
+    "1", "true", "yes", "on"
+}
+ADMIN_RESET_SECRET = os.getenv("ADMIN_RESET_SECRET", "").strip()
 
 COLOR_STATES = ["red", "green", "violet"]
 SIZE_STATES = ["small", "big"]
@@ -55,8 +89,18 @@ HEADERS = {
 
 FIREBASE_PROJECT_ID = os.getenv("FIREBASE_PROJECT_ID", "").strip()
 FIREBASE_CREDENTIALS = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
+_firestore_flag = os.getenv("FIRESTORE_ENABLED", "").strip().lower()
+FIRESTORE_ENABLED = (
+    _firestore_flag in {"1", "true", "yes", "on"}
+    if _firestore_flag
+    else bool(FIREBASE_PROJECT_ID or FIREBASE_CREDENTIALS)
+)
 
 def get_firestore():
+    if not FIRESTORE_ENABLED:
+        raise RuntimeError(
+            "Firestore is disabled; set FIRESTORE_ENABLED=true and configure credentials to enable it"
+        )
     if not firebase_admin._apps:
         opts = {"projectId": FIREBASE_PROJECT_ID} if FIREBASE_PROJECT_ID else None
         if FIREBASE_CREDENTIALS:
@@ -68,8 +112,7 @@ def get_firestore():
 
 class PredictorEngine:
     def __init__(self) -> None:
-        self.session = requests.Session()
-        self.session.headers.update(HEADERS)
+        self.session = httpx.Client(headers=HEADERS, timeout=10.0, follow_redirects=True)
         self.stop_event = threading.Event()
         self.worker: Optional[threading.Thread] = None
         self.lock = threading.RLock()
@@ -78,6 +121,7 @@ class PredictorEngine:
         self.last_poll_at: Optional[int] = None
         self.last_api_ok_at: Optional[int] = None
         self.last_seen_issue: Optional[str] = None
+        self.last_source_status: Optional[int] = None
 
         self.ema_decay = float(os.getenv("EMA_DECAY", "0.82"))
         self._setup_db()
@@ -268,15 +312,23 @@ class PredictorEngine:
                     "pageSize": page_size,
                     "ts": int(time.time() * 1000),
                 },
-                timeout=10,
             )
             response.raise_for_status()
             data = response.json()
 
             self.last_api_ok_at = int(time.time())
             self.last_error = None
+            self.last_source_status = response.status_code
             return data
 
+        except httpx.HTTPStatusError as exc:
+            status_code = exc.response.status_code
+            message = f"Source HTTP {status_code}: direct collector access unavailable"
+            if self.last_error != message:
+                logger.warning("%s; no bypass attempted", message)
+            self.last_source_status = status_code
+            self.last_error = message
+            return None
         except Exception as exc:
             self.last_error = f"{type(exc).__name__}: {exc}"
             return None
@@ -334,11 +386,11 @@ class PredictorEngine:
         total = sum(max(float(scores.get(state, 0.0)), 0.0) for state in states)
 
         if total <= 0:
-            uniform = 1.0 / len(states)
+            uniform = safe_divide(1.0, len(states))
             return {state: uniform for state in states}
 
         return {
-            state: max(float(scores.get(state, 0.0)), 0.0) / total
+            state: safe_divide(max(float(scores.get(state, 0.0)), 0.0), total)
             for state in states
         }
 
@@ -461,10 +513,10 @@ class PredictorEngine:
         for probability in distribution.values():
             p = float(probability)
             if p > 0:
-                entropy -= p * math.log2(p)
+                entropy -= p * math.log2(max(p, MATH_EPSILON))
 
-        maximum = math.log2(len(distribution))
-        return entropy / maximum if maximum > 0 else 0.0
+        maximum = math.log2(max(len(distribution), 1))
+        return safe_divide(entropy, maximum, 0.0)
 
     @staticmethod
     def gap_since_previous_same(sequence: Sequence[Hashable]) -> int:
@@ -492,7 +544,7 @@ class PredictorEngine:
             if seq[i] != seq[i - 1]
         )
 
-        return changes / (len(seq) - 1)
+        return safe_divide(changes, len(seq) - 1, 0.5)
 
     # ---------------------------------------------------------
     # Feature and joint state helpers
@@ -522,7 +574,7 @@ class PredictorEngine:
             seq = [game[feature] for game in recent]
             values.append(self.volatility(seq, window=len(seq)))
 
-        return sum(values) / len(values)
+        return safe_divide(sum(values), len(values), 0.5)
 
     @staticmethod
     def regime_from_volatility(volatility: float) -> str:
@@ -578,7 +630,7 @@ class PredictorEngine:
             raw["context"] = 0.15 * (0.25 + 0.75 * context_strength)
 
         total = sum(raw.values())
-        return {name: value / total for name, value in raw.items()}
+        return {name: safe_divide(value, total, 1.0 / len(raw)) for name, value in raw.items()}
 
     def context_distribution(
         self,
@@ -768,26 +820,34 @@ class PredictorEngine:
         lookback: int = 80,
         min_train: int = 30,
     ) -> Dict[str, Dict[str, float]]:
+        # Freeze the full sequence, then slice strictly before target_index.
+        # This makes the no-future-data invariant explicit and prevents a
+        # mutable caller from changing the sequence during evaluation.
+        frozen_sequence = tuple(int(value) for value in sequence)
         names = ("ema", "markov", "pattern", "frequency")
         stats = {name: {"correct": 0.0, "tested": 0.0, "logloss": 0.0} for name in names}
 
-        start = max(min_train, len(sequence) - lookback)
-        for target_index in range(start, len(sequence)):
-            train = list(sequence[:target_index])
-            actual = int(sequence[target_index])
+        start = max(min_train, len(frozen_sequence) - lookback)
+        for target_index in range(start, len(frozen_sequence)):
+            train = list(frozen_sequence[:target_index])
+            actual = frozen_sequence[target_index]
+            if len(train) != target_index:
+                raise RuntimeError("walk-forward training boundary violated")
             candidates = self.candidate_number_distributions(train)
 
             for name, dist in candidates.items():
                 predicted = max(dist, key=dist.get)
                 stats[name]["tested"] += 1.0
                 stats[name]["correct"] += float(predicted == actual)
-                stats[name]["logloss"] += -math.log(max(float(dist.get(actual, 0.0)), 1e-9))
+                stats[name]["logloss"] += safe_negative_log_probability(
+                    float(dist.get(actual, 0.0))
+                )
 
         for name in names:
             tested = stats[name]["tested"]
             if tested:
-                stats[name]["accuracy"] = stats[name]["correct"] / tested
-                stats[name]["logloss"] /= tested
+                stats[name]["accuracy"] = safe_divide(stats[name]["correct"], tested)
+                stats[name]["logloss"] = safe_divide(stats[name]["logloss"], tested)
             else:
                 stats[name]["accuracy"] = 0.10
                 stats[name]["logloss"] = math.log(10.0)
@@ -806,7 +866,7 @@ class PredictorEngine:
             raw[name] = 0.05 + reliability * quality
 
         total = sum(raw.values())
-        return ({name: value / total for name, value in raw.items()}, stats)
+        return ({name: safe_divide(value, total, 1.0 / len(raw)) for name, value in raw.items()}, stats)
 
     def predict_number(self, games: List[Dict[str, Any]]) -> Dict[str, Any]:
         sequence = [int(game["number"]) for game in games]
@@ -1157,7 +1217,7 @@ class PredictorEngine:
             # it here instead of relying on the collector winning that race.
             _settle_flash_live_bet(game)
 
-            if inserted:
+            if inserted and FIRESTORE_ENABLED:
                 try:
                     self.persist_round_firestore(game)
                 except Exception as exc:
@@ -1209,6 +1269,7 @@ class PredictorEngine:
 
         if self.worker and self.worker.is_alive():
             self.worker.join(timeout=3)
+        self.session.close()
 
     # ---------------------------------------------------------
     # API serialization helpers
@@ -1305,7 +1366,7 @@ class PredictorEngine:
             return {
                 "correct": correct,
                 "tested": tested,
-                "accuracy": correct / tested,
+            "accuracy": safe_divide(correct, tested),
             }
 
         signal_counts = defaultdict(int)
@@ -1324,6 +1385,7 @@ class PredictorEngine:
     def status(self) -> Dict[str, Any]:
         return {
             "service": "online",
+            "internal_collector_enabled": ENABLE_INTERNAL_COLLECTOR,
             "worker_running": bool(self.worker and self.worker.is_alive()),
             "db_path": DB_PATH,
             "stored_rounds": self.count_rounds(),
@@ -1331,7 +1393,9 @@ class PredictorEngine:
             "minimum_history": MIN_HISTORY,
             "last_poll_at": self.last_poll_at,
             "last_api_ok_at": self.last_api_ok_at,
+            "source_status": self.last_source_status,
             "last_error": self.last_error,
+            "persistence": "firestore/sqlite-cache" if FIRESTORE_ENABLED else "local-sqlite",
         }
 
 
@@ -1345,25 +1409,34 @@ async def lifespan(app: FastAPI):
     # create a fresh 1-round database. During this short restore Render may
     # return 502/503; the collector retries until startup is complete.
     local_before = engine.count_rounds()
-    if local_before == 0:
+    if local_before == 0 and FIRESTORE_ENABLED:
         try:
             restored = engine.hydrate_rounds_firestore(HISTORY_LIMIT)
-            print(f"[STARTUP] Firestore -> SQLite restored={restored} rounds", flush=True)
+            logger.info("startup Firestore -> SQLite restored=%s rounds", restored)
         except Exception as exc:
             engine.last_error = f"startup hydrate: {type(exc).__name__}: {exc}"
-            print(f"[STARTUP] Firestore hydration failed: {engine.last_error}", flush=True)
+            logger.error("startup Firestore hydration failed: %s", engine.last_error)
 
         try:
             restored_live = _hydrate_flash_live_firestore(250)
             if restored_live:
-                print(f"[STARTUP] live simulator restored={restored_live}", flush=True)
+                logger.info("startup live simulator restored=%s", restored_live)
         except Exception as exc:
-            print(f"[STARTUP] live simulator hydration warning: {type(exc).__name__}: {exc}", flush=True)
+            logger.warning(
+                "startup live simulator hydration warning: %s: %s",
+                type(exc).__name__,
+                exc,
+            )
 
-    print(f"[STARTUP] backend ready with {engine.count_rounds()} cached rounds", flush=True)
-    engine.start_worker()
+    logger.info("startup backend ready with %s cached rounds", engine.count_rounds())
+    if ENABLE_INTERNAL_COLLECTOR:
+        logger.info("internal collector enabled; polling every %.1fs", POLL_SECONDS)
+        engine.start_worker()
+    else:
+        logger.info("internal collector disabled; waiting for external /api/ingest collector")
     yield
-    engine.stop_worker()
+    if ENABLE_INTERNAL_COLLECTOR:
+        engine.stop_worker()
 
 
 
@@ -1381,6 +1454,10 @@ V93_ENTROPY_STOP = float(os.getenv("V93_ENTROPY_STOP", "0.78"))
 V93_SWITCH_RATE_STOP = float(os.getenv("V93_SWITCH_RATE_STOP", "0.72"))
 V93_MIN_SUPPORT = int(os.getenv("V93_MIN_SUPPORT", "50"))
 V93_MIN_AGREEMENT = int(os.getenv("V93_MIN_AGREEMENT", "3"))
+V93_ISOTONIC_MIN_SAMPLES = max(40, int(os.getenv("V93_ISOTONIC_MIN_SAMPLES", "60")))
+V93_CONFIDENCE_THRESHOLD = max(0.50, min(0.75, float(os.getenv("V93_CONFIDENCE_THRESHOLD", "0.58"))))
+V93_STRONG_THRESHOLD = max(V93_CONFIDENCE_THRESHOLD, min(0.85, float(os.getenv("V93_STRONG_THRESHOLD", "0.62"))))
+V93_CHOPPY_FILTER = max(0.50, min(0.95, float(os.getenv("V93_CHOPPY_FILTER", "0.70"))))
 
 def _v93_b(x):
     return 1 if str(x).lower() == "big" else 0
@@ -1389,14 +1466,14 @@ def _v93_clip(x, lo=0.02, hi=0.98):
     return float(np.clip(float(x), lo, hi))
 
 def _v93_binary_entropy(p):
-    p = min(max(float(p), 1e-9), 1 - 1e-9)
-    return float(-(p*math.log2(p) + (1-p)*math.log2(1-p)))
+    p = safe_probability(p)
+    return float(-(p * math.log2(p) + (1 - p) * math.log2(max(1 - p, MATH_EPSILON))))
 
 def _v93_switch_rate(vals, n=20):
     v = vals[-n:]
     if len(v) < 2:
         return 0.5
-    return float(sum(a != b for a, b in zip(v[:-1], v[1:])) / (len(v)-1))
+    return safe_divide(sum(a != b for a, b in zip(v[:-1], v[1:])), len(v) - 1, 0.5)
 
 def _v93_transition_matrix(vals, n=40):
     v = vals[-n:]
@@ -1406,7 +1483,7 @@ def _v93_transition_matrix(vals, n=40):
     out = []
     for row in c:
         s = sum(row)
-        out.append([row[0]/s, row[1]/s])
+        out.append([safe_divide(row[0], s, 0.5), safe_divide(row[1], s, 0.5)])
     return out
 
 def _v93_transition_entropy(vals, n=30):
@@ -1430,6 +1507,39 @@ def _v93_ema(vals, span):
     for x in vals[1:]:
         e = alpha*float(x) + (1-alpha)*e
     return float(e)
+
+def _v93_recent_weighted_mean(vals, window=30, decay=0.88):
+    """Exponentially emphasize recent outcomes without leaking future rounds."""
+    v = list(vals[-window:])
+    if not v:
+        return 0.5
+    weights = [decay ** (len(v) - 1 - i) for i in range(len(v))]
+    return safe_divide(sum(float(x) * w for x, w in zip(v, weights)), sum(weights), 0.5)
+
+def _v93_tail_streak(vals):
+    if not vals:
+        return None, 0
+    state, length = vals[-1], 1
+    for value in reversed(vals[:-1]):
+        if value != state:
+            break
+        length += 1
+    return int(state), int(length)
+
+def _v93_window_alignment(vals):
+    """Compare 10–15 round momentum with a 50–100 round stability window."""
+    short_n = min(15, len(vals))
+    long_n = min(80, len(vals))
+    short_rate = safe_divide(sum(vals[-short_n:]), short_n, 0.5)
+    long_rate = safe_divide(sum(vals[-long_n:]), long_n, 0.5)
+    short_direction = 1 if short_rate >= 0.5 else 0
+    long_direction = 1 if long_rate >= 0.5 else 0
+    return {
+        "short_rate": float(short_rate),
+        "long_rate": float(long_rate),
+        "aligned": bool(short_direction == long_direction),
+        "divergence": float(abs(short_rate - long_rate)),
+    }
 
 def _v93_sequence_stability(vals, n=16):
     v = vals[-n:]
@@ -1471,16 +1581,17 @@ def _v93_ngram_probability(vals, order=3):
                 big += 1
             else:
                 small += 1
-    return float(big/(big+small)), support
+    return safe_divide(big, big + small, 0.5), support
 
 def _v93_trend_model(vals):
-    """Trend follower: short/medium EMA + recent momentum."""
-    ema3 = _v93_ema(vals[-30:], 3)
-    ema8 = _v93_ema(vals[-50:], 8)
-    ema20 = _v93_ema(vals[-80:], 20)
-    momentum = (ema3 - ema20)
-    slope = (ema8 - ema20)
-    score = 0.5 + 0.75*momentum + 0.35*slope
+    """Trend follower using distinct short and long dynamic windows."""
+    short = _v93_ema(vals[-15:], 5)
+    medium = _v93_ema(vals[-30:], 10)
+    long = _v93_ema(vals[-80:], 24)
+    recent = _v93_recent_weighted_mean(vals, 30, 0.88)
+    momentum = short - long
+    slope = medium - long
+    score = 0.5 + 0.70*momentum + 0.30*slope + 0.25*(recent-long)
     return _v93_clip(score)
 
 def _v93_reversion_model(vals):
@@ -1490,13 +1601,17 @@ def _v93_reversion_model(vals):
     """
     if len(vals) < 20:
         return 0.5
-    r10 = sum(vals[-10:]) / 10.0
-    r30 = sum(vals[-30:]) / min(30, len(vals))
-    gap_big = min(_v93_gap_since(vals, 1), 12) / 12.0
-    gap_small = min(_v93_gap_since(vals, 0), 12) / 12.0
-    gap_to_mean = 0.5 - r10
+    r12 = sum(vals[-12:]) / 12.0
+    r60 = sum(vals[-60:]) / min(60, len(vals))
+    gap_big = min(_v93_gap_since(vals, 1), 10) / 10.0
+    gap_small = min(_v93_gap_since(vals, 0), 10) / 10.0
+    streak_state, streak_length = _v93_tail_streak(vals)
+    streak_strength = min(max(streak_length - 2, 0) / 4.0, 1.0)
+    # A long Big run presses toward Small; a long Small run presses toward Big.
+    streak_pressure = (1.0 if streak_state == 0 else -1.0) * streak_strength
+    gap_to_mean = 0.5 - r12
     # Positive -> Big reversion hypothesis, negative -> Small.
-    score = 0.5 + 0.55*gap_to_mean + 0.18*(0.5-r30) + 0.12*(gap_big-gap_small)
+    score = 0.5 + 0.45*gap_to_mean + 0.15*(0.5-r60) + 0.25*(gap_big-gap_small) + 0.22*streak_pressure
     return _v93_clip(score)
 
 def _v93_pattern_model(vals):
@@ -1509,27 +1624,37 @@ def _v93_pattern_model(vals):
     w3 = min(s3/10.0, 1.0)
     w2 = min(s2/15.0, 1.0)
     denom = 1.0 + 0.8*w2 + 1.0*w3
-    p = (markov + 0.8*w2*p2 + 1.0*w3*p3) / denom
+    p = safe_divide(markov + 0.8*w2*p2 + 1.0*w3*p3, denom, 0.5)
     return _v93_clip(p), {"markov": markov, "ngram2_support": s2, "ngram3_support": s3}
 
 def _v93_raw_ensemble(vals):
     trend = _v93_trend_model(vals)
     revert = _v93_reversion_model(vals)
     pattern, pmeta = _v93_pattern_model(vals)
-    regime, _ = _v93_regime(vals)
+    regime, choppy_score = _v93_regime(vals)
+    alignment = _v93_window_alignment(vals)
 
-    # Diversified equal-weight base. In CHOPPY conditions, pattern matching gets
-    # a little more weight, but permission to predict is handled separately.
+    # Choppy/high-volatility sequences suppress trend and N-gram extrapolation;
+    # stable sequences can lean more heavily on recent trend.
     if regime == "CHOPPY":
-        raw = 0.25*trend + 0.25*revert + 0.50*pattern
+        weights = {"trend": 0.15, "reversion": 0.75, "pattern": 0.10}
     else:
-        raw = (trend + revert + pattern) / 3.0
+        weights = {"trend": 0.50, "reversion": 0.30, "pattern": 0.20}
+    raw = trend*weights["trend"] + revert*weights["reversion"] + pattern*weights["pattern"]
+    if not alignment["aligned"]:
+        # Conflicting time horizons reduce edge instead of forcing a direction.
+        raw = 0.5 + 0.55*(raw-0.5)
 
     votes = [
         1 if trend >= 0.5 else 0,
         1 if revert >= 0.5 else 0,
         1 if pattern >= 0.5 else 0,
     ]
+    pmeta.update({
+        "weights": weights,
+        "alignment": alignment,
+        "choppy_score": choppy_score,
+    })
     return _v93_clip(raw), (trend, revert, pattern), votes, pmeta
 
 def _v93_walkforward(vals):
@@ -1546,7 +1671,7 @@ def _v93_walkforward(vals):
         except Exception:
             continue
     iso = None
-    if len(raw) >= 30 and len(set(actual)) >= 2:
+    if len(raw) >= V93_ISOTONIC_MIN_SAMPLES and len(set(actual)) >= 2:
         iso = IsotonicRegression(out_of_bounds="clip", y_min=0.02, y_max=0.98)
         iso.fit(np.asarray(raw), np.asarray(actual))
     return iso, raw, actual
@@ -1560,7 +1685,7 @@ def build_v93_flash(games):
             "reason": f"need {V93_MIN_TRAIN} rounds",
             "rounds": len(vals),
             "signal": "SKIP",
-            "model": "V9.5.1 Flash Live"
+            "model": "V9.5.3 Flash Live"
         }
 
     vals = vals[-V93_WINDOW:]
@@ -1571,7 +1696,11 @@ def build_v93_flash(games):
     calibrated_p = float(iso.predict([raw_p])[0]) if iso is not None else raw_p
     calibration_weight = 0.0
     if iso is not None:
-        calibration_weight = float(np.clip((len(wf_y) - 30) / 70.0, 0.0, 1.0))
+        calibration_weight = float(np.clip(
+            safe_divide(len(wf_y) - V93_ISOTONIC_MIN_SAMPLES, 80.0),
+            0.0,
+            1.0,
+        ))
     p_big = float((1.0 - calibration_weight) * raw_p + calibration_weight * calibrated_p)
     p_big = _v93_clip(p_big)
 
@@ -1586,14 +1715,29 @@ def build_v93_flash(games):
     stability = _v93_sequence_stability(vals)
 
     agreement = sum((v == 1) == predicted_big for v in votes)
-    threshold = 0.50
-
-    # V9.5 always emits a direction once minimum history is available.
-    # Quality describes evidence strength instead of suppressing the prediction.
+    threshold = V93_CONFIDENCE_THRESHOLD
     edge = abs(p_big - 0.5)
-    if conf >= 0.62 and agreement >= 2 and len(wf_y) >= 40:
+    trend_reversion_conflict = (
+        (components[0] - 0.5) * (components[1] - 0.5) < 0
+        and abs(components[0] - components[1]) >= 0.10
+    )
+    alignment = pmeta["alignment"]
+    skip_reasons = []
+    if conf < V93_CONFIDENCE_THRESHOLD:
+        skip_reasons.append("confidence_below_58_percent")
+    if choppy_score > V93_CHOPPY_FILTER and agreement < 3:
+        skip_reasons.append("low_agreement_in_choppy_regime")
+    elif agreement < 2:
+        skip_reasons.append("low_agreement")
+    if trend_reversion_conflict:
+        skip_reasons.append("trend_reversion_conflict")
+    if not alignment["aligned"] and alignment["divergence"] >= 0.10:
+        skip_reasons.append("short_long_window_mismatch")
+
+    signal = "SKIP" if skip_reasons else "PREDICT"
+    if signal == "PREDICT" and conf >= V93_STRONG_THRESHOLD and agreement >= 2 and len(wf_y) >= 40:
         quality = "STRONG"
-    elif conf >= 0.56 and agreement >= 2 and len(wf_y) >= 20:
+    elif signal == "PREDICT":
         quality = "MEDIUM"
     else:
         quality = "LOW"
@@ -1603,36 +1747,36 @@ def build_v93_flash(games):
         warnings.append("high_entropy")
     if switch_rate > V93_SWITCH_RATE_STOP:
         warnings.append("high_volatility")
-    if len(wf_y) < 30:
+    if len(wf_y) < V93_ISOTONIC_MIN_SAMPLES:
         warnings.append("low_support")
     if agreement < 2:
         warnings.append("low_agreement")
 
-    signal = "PREDICT"
-
-    # Walk-forward accuracy for every historical direction, not only rare 80%+ cases.
+    # Selective walk-forward score: coverage now reflects the strict confidence gate.
     hits = preds = 0
     for rp, y in zip(wf_raw, wf_y):
         cp = float(iso.predict([rp])[0]) if iso is not None else float(rp)
         # Same support-aware calibration blend used for the current prediction.
         cp = float((1.0 - calibration_weight) * rp + calibration_weight * cp)
+        if max(cp, 1.0-cp) < V93_CONFIDENCE_THRESHOLD:
+            continue
         preds += 1
         hits += int((cp >= 0.5) == bool(y))
-    oos_acc = (hits/preds) if preds else None
-    coverage = 1.0 if preds else 0.0
+    oos_acc = safe_divide(hits, preds) if preds else None
+    coverage = safe_divide(preds, len(wf_y), 0.0) if wf_y else 0.0
 
     return {
         "ready": True,
-        "model": "V9.5.1 Flash Live",
+        "model": "V9.5.3 Flash Live",
         "prediction": predicted,
-        "decision": predicted.upper(),
+        "decision": "SKIP" if signal == "SKIP" else predicted.upper(),
         "raw_p_big": round(raw_p, 4),
         "p_big": round(p_big, 4),
         "calibration_weight": round(calibration_weight, 4),
         "calibration_support": len(wf_y),
         "calibrated_confidence": round(conf, 4),
         "signal": signal,
-        "skip_reasons": [],
+        "skip_reasons": skip_reasons,
         "warnings": warnings,
         "quality": quality,
         "edge": round(edge, 4),
@@ -1657,6 +1801,7 @@ def build_v93_flash(games):
             "markov": round(float(pmeta["markov"]), 4),
             "ngram2_support": int(pmeta["ngram2_support"]),
             "ngram3_support": int(pmeta["ngram3_support"]),
+            "weights": {key: round(float(value), 4) for key, value in pmeta["weights"].items()},
         },
         "features": {
             "ema3": round(_v93_ema(vals[-30:], 3), 4),
@@ -1665,8 +1810,16 @@ def build_v93_flash(games):
             "gap_since_big": int(_v93_gap_since(vals, 1)),
             "gap_since_small": int(_v93_gap_since(vals, 0)),
             "gap_to_mean_10": round(0.5 - sum(vals[-10:])/10.0, 4),
+            "tail_streak_state": "big" if _v93_tail_streak(vals)[0] == 1 else "small",
+            "tail_streak_length": _v93_tail_streak(vals)[1],
+            "recent_weighted_big_rate": round(_v93_recent_weighted_mean(vals, 30, 0.88), 4),
+            "short_window_big_rate": round(alignment["short_rate"], 4),
+            "long_window_big_rate": round(alignment["long_rate"], 4),
+            "short_long_aligned": alignment["aligned"],
+            "short_long_divergence": round(alignment["divergence"], 4),
+            "trend_reversion_conflict": trend_reversion_conflict,
         },
-        "note": "V9.5.1 research direction. Chronology is fixed and a direction is produced every completed round after the minimum history. Confidence remains conservative and is not a guaranteed probability."
+        "note": "V9.5.3 research signal. Only calibrated confidence >=58% with acceptable regime/alignment is actionable; SKIP means no paper bet. Confidence is not a guaranteed probability."
     }
 
 
@@ -1682,11 +1835,19 @@ def simulate_v93_virtual_balance(
     target_balance: float,
     stake_percent: float = 0.02,
     max_rounds: int = 200,
+    stake_mode: str = "percent",
+    flat_stake: float = 10.0,
+    stop_loss_percent: float = 30.0,
+    max_consecutive_losses: int = 0,
 ):
     starting_balance = float(max(starting_balance, 1.0))
     target_balance = float(max(target_balance, starting_balance))
     stake_percent = float(np.clip(stake_percent, 0.001, 0.05))
     max_rounds = int(np.clip(max_rounds, 1, 1000))
+    stake_mode = "flat" if str(stake_mode).lower() == "flat" else "percent"
+    flat_stake = float(max(flat_stake, 0.01))
+    stop_loss_percent = float(np.clip(stop_loss_percent, 0.0, 100.0))
+    max_consecutive_losses = int(np.clip(max_consecutive_losses, 0, 100))
 
     # Input from load_history is already oldest -> newest.
     ordered = list(games)
@@ -1702,9 +1863,13 @@ def simulate_v93_virtual_balance(
     balance = starting_balance
     peak = balance
     lowest = balance
+    max_drawdown = 0.0
+    stop_balance = starting_balance * (1.0 - stop_loss_percent / 100.0)
     start_i = max(V93_MIN_TRAIN, len(usable) - max_rounds)
     rows = []
     predictions = wins = losses = skips = 0
+    consecutive_losses = 0
+    longest_losing_streak = 0
     stop_reason = "history_exhausted"
 
     for i in range(start_i, len(usable)):
@@ -1722,19 +1887,25 @@ def simulate_v93_virtual_balance(
 
         # Virtual fixed-fraction stake. This is deliberately capped and does
         # not use Kelly/Martingale or any live-wallet logic.
-        virtual_stake = min(balance * stake_percent, max(balance, 0.0))
+        requested_stake = flat_stake if stake_mode == "flat" else balance * stake_percent
+        virtual_stake = min(requested_stake, max(balance, 0.0))
         won = prediction == actual
 
         if won:
             balance += virtual_stake
             wins += 1
+            consecutive_losses = 0
         else:
             balance -= virtual_stake
             losses += 1
+            consecutive_losses += 1
+            longest_losing_streak = max(longest_losing_streak, consecutive_losses)
         predictions += 1
 
         peak = max(peak, balance)
         lowest = min(lowest, balance)
+        drawdown = safe_divide(peak - balance, peak) if peak > 0 else 0.0
+        max_drawdown = max(max_drawdown, drawdown)
 
         rows.append({
             "issue": str(usable[i].get("issue","")),
@@ -1744,6 +1915,7 @@ def simulate_v93_virtual_balance(
             "virtual_stake_pkr": round(virtual_stake, 2),
             "result": "WIN" if won else "LOSS",
             "balance_pkr": round(balance, 2),
+            "drawdown_percent": round(drawdown * 100.0, 2),
         })
 
         if balance >= target_balance:
@@ -1753,8 +1925,14 @@ def simulate_v93_virtual_balance(
             balance = 0.0
             stop_reason = "virtual_balance_depleted"
             break
+        if stop_loss_percent > 0 and balance <= stop_balance:
+            stop_reason = "stop_loss_reached"
+            break
+        if max_consecutive_losses > 0 and consecutive_losses >= max_consecutive_losses:
+            stop_reason = "consecutive_loss_limit"
+            break
 
-    hit_rate = (wins / predictions) if predictions else None
+    hit_rate = safe_divide(wins, predictions) if predictions else None
     pnl = balance - starting_balance
     return {
         "ready": True,
@@ -1766,8 +1944,15 @@ def simulate_v93_virtual_balance(
         "max_balance_reached_pkr": round(peak, 2),
         "min_balance_reached_pkr": round(lowest, 2),
         "profit_loss_pkr": round(pnl, 2),
-        "return_percent": round((pnl / starting_balance) * 100.0, 2),
+        "return_percent": round(safe_divide(pnl, starting_balance) * 100.0, 2),
         "virtual_stake_percent": round(stake_percent * 100.0, 2),
+        "stake_mode": stake_mode,
+        "flat_stake_pkr": round(flat_stake, 2) if stake_mode == "flat" else None,
+        "stop_loss_percent": round(stop_loss_percent, 2),
+        "stop_balance_pkr": round(stop_balance, 2),
+        "max_consecutive_losses": max_consecutive_losses,
+        "longest_losing_streak": longest_losing_streak,
+        "max_drawdown_percent": round(max_drawdown * 100.0, 2),
         "predictions": predictions,
         "wins": wins,
         "losses": losses,
@@ -1776,7 +1961,7 @@ def simulate_v93_virtual_balance(
         "stop_reason": stop_reason,
         "rounds_processed": len(rows),
         "history": rows[-250:],
-        "note": "Historical paper simulation only. V9.5.1 evaluates every generated direction after the minimum history; it does not place real bets or control a wallet."
+        "note": "Historical paper simulation only. V9.5.3 evaluates generated directions after the minimum history; it does not place real bets or control a wallet."
     }
 
 
@@ -1875,10 +2060,11 @@ def _settle_flash_live_bet(game: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         out = dict(conn.execute(
             "SELECT * FROM flash_live_bets WHERE issue = ?", (issue,)
         ).fetchone())
-    try:
-        _persist_flash_live_firestore(out)
-    except Exception:
-        pass
+    if FIRESTORE_ENABLED:
+        try:
+            _persist_flash_live_firestore(out)
+        except Exception:
+            pass
     return out
 
 
@@ -1886,7 +2072,14 @@ def _open_flash_live_bet(games: List[Dict[str, Any]]) -> Optional[Dict[str, Any]
     if not games:
         return None
     flash = build_v93_flash(games)
-    if not flash.get("ready"):
+    if not flash.get("ready") or flash.get("signal") != "PREDICT":
+        if flash.get("ready"):
+            logger.info(
+                "live paper bet skipped based_on=%s confidence=%.4f reasons=%s",
+                games[-1].get("issue"),
+                float(flash.get("calibrated_confidence", 0.5)),
+                ",".join(flash.get("skip_reasons") or ["filtered"]),
+            )
         return None
     based_on_issue = str(games[-1]["issue"])
     target_issue = _next_issue_id(based_on_issue)
@@ -1917,15 +2110,68 @@ def _open_flash_live_bet(games: List[Dict[str, Any]]) -> Optional[Dict[str, Any]
             "SELECT * FROM flash_live_bets WHERE issue = ?", (target_issue,)
         ).fetchone()
         out = dict(saved) if saved else row
-    try:
-        _persist_flash_live_firestore(out)
-    except Exception:
-        pass
+    if FIRESTORE_ENABLED:
+        try:
+            _persist_flash_live_firestore(out)
+        except Exception:
+            pass
     return out
+
+
+def _reconcile_flash_live_pending() -> int:
+    """Settle predictions whose result arrived during a restart/backfill gap."""
+    now = int(time.time())
+    with engine._connect() as conn:
+        pending = [dict(row) for row in conn.execute(
+            "SELECT issue, prediction FROM flash_live_bets WHERE result IS NULL"
+        ).fetchall()]
+        latest_round = conn.execute("""
+            SELECT issue FROM rounds
+            ORDER BY LENGTH(issue) DESC, issue DESC
+            LIMIT 1
+        """).fetchone()
+        latest_issue = str(latest_round["issue"]) if latest_round else ""
+        reconciled_issues = []
+        for row in pending:
+            issue = str(row["issue"])
+            completed = conn.execute(
+                "SELECT size FROM rounds WHERE issue = ?", (issue,)
+            ).fetchone()
+            if completed:
+                actual = str(completed["size"]).lower()
+                result = "WIN" if str(row["prediction"]).lower() == actual else "LOSS"
+                conn.execute("""
+                    UPDATE flash_live_bets
+                    SET actual = ?, result = ?, settled_at = ?
+                    WHERE issue = ? AND result IS NULL
+                """, (actual, result, now, issue))
+                reconciled_issues.append(issue)
+            elif issue.isdigit() and latest_issue.isdigit() and int(issue) < int(latest_issue):
+                # The source skipped this historical result and has already moved on.
+                conn.execute("""
+                    UPDATE flash_live_bets
+                    SET result = 'VOID', settled_at = ?
+                    WHERE issue = ? AND result IS NULL
+                """, (now, issue))
+                reconciled_issues.append(issue)
+        conn.commit()
+        reconciled = [dict(conn.execute(
+            "SELECT * FROM flash_live_bets WHERE issue = ?", (issue,)
+        ).fetchone()) for issue in reconciled_issues]
+    if FIRESTORE_ENABLED:
+        for row in reconciled:
+            try:
+                _persist_flash_live_firestore(row)
+            except Exception:
+                logger.warning("could not persist reconciled live issue=%s", row.get("issue"))
+    if reconciled:
+        logger.info("reconciled %s stale live paper predictions", len(reconciled))
+    return len(reconciled)
 
 
 def _flash_live_status(limit: int = 50) -> Dict[str, Any]:
     limit = int(max(1, min(limit, 250)))
+    _reconcile_flash_live_pending()
     with engine._connect() as conn:
         rows = [dict(r) for r in conn.execute("""
             SELECT * FROM flash_live_bets
@@ -1967,7 +2213,7 @@ def _flash_live_status(limit: int = 50) -> Dict[str, Any]:
         "losses": losses,
         "pending": pending,
         "settled": settled,
-        "hit_rate": round(wins / settled, 4) if settled else None,
+        "hit_rate": round(safe_divide(wins, settled), 4) if settled else None,
         "current_streak": None if not streak_type else {"result": streak_type, "count": streak},
         "pending_prediction": current_pending,
         "history": rows,
@@ -1979,7 +2225,7 @@ _ensure_flash_live_table()
 
 app = FastAPI(
     title="WinGo Statistical Predictor API",
-    version="9.5.1",
+    version="9.5.3",
     lifespan=lifespan,
 )
 
@@ -2007,15 +2253,61 @@ app.add_middleware(
 def root():
     return {
         "name": "WinGo Statistical Predictor API",
-        "version": "9.5.1",
+        "version": "9.5.3",
         "status": "online",
         "docs": "/docs",
     }
 
 
 @app.get("/health")
-def health():
-    return engine.status()
+async def health():
+    """Readiness check with an actual async DB query and worker liveness."""
+    status = engine.status()
+    db_started = time.perf_counter()
+    db_error = None
+    db_connected = False
+    db_rounds = None
+    try:
+        async with aiosqlite.connect(DB_PATH, timeout=3) as conn:
+            async with conn.execute("SELECT COUNT(*) FROM rounds") as cursor:
+                row = await cursor.fetchone()
+                db_rounds = int(row[0]) if row else 0
+        db_connected = True
+    except Exception as exc:
+        db_error = f"{type(exc).__name__}: {exc}"
+
+    worker_alive = bool(engine.worker and engine.worker.is_alive())
+    last_poll_age = (
+        max(0, int(time.time()) - int(engine.last_poll_at))
+        if engine.last_poll_at is not None
+        else None
+    )
+    worker_fresh = (not ENABLE_INTERNAL_COLLECTOR) or (
+        worker_alive and (
+            last_poll_age is None or last_poll_age <= max(30, int(POLL_SECONDS * 5))
+        )
+    )
+    healthy = db_connected and worker_fresh
+    payload = {
+        **status,
+        "service": "online" if healthy else "degraded",
+        "checks": {
+            "database": {
+                "ok": db_connected,
+                "rounds": db_rounds,
+                "latency_ms": round((time.perf_counter() - db_started) * 1000.0, 2),
+                "error": db_error,
+            },
+            "worker": {
+                "ok": worker_fresh,
+                "enabled": ENABLE_INTERNAL_COLLECTOR,
+                "mode": "internal" if ENABLE_INTERNAL_COLLECTOR else "external_ingest",
+                "alive": worker_alive,
+                "last_poll_age_seconds": last_poll_age,
+            },
+        },
+    }
+    return JSONResponse(payload, status_code=200 if healthy else 503)
 
 
 @app.get("/api/dashboard")
@@ -2060,6 +2352,77 @@ class RoundInput(BaseModel):
     secret: str = ""
 
 
+class ResetDataRequest(BaseModel):
+    confirmation: Literal["DELETE ALL DATA"]
+
+
+def _delete_firestore_collection(collection_name: str, batch_size: int = 200) -> int:
+    db = get_firestore()
+    deleted = 0
+    while True:
+        docs = list(db.collection(collection_name).limit(batch_size).stream())
+        if not docs:
+            break
+        batch = db.batch()
+        for doc in docs:
+            batch.delete(doc.reference)
+        batch.commit()
+        deleted += len(docs)
+    return deleted
+
+
+@app.post("/api/admin/reset-data")
+def reset_all_data(
+    request: ResetDataRequest,
+    x_admin_secret: Optional[str] = Header(default=None, alias="X-Admin-Secret"),
+):
+    """Irreversibly clear model history after explicit secret + phrase checks."""
+    if not ADMIN_RESET_SECRET:
+        raise HTTPException(status_code=503, detail="ADMIN_RESET_SECRET is not configured")
+    if not secrets.compare_digest(x_admin_secret or "", ADMIN_RESET_SECRET):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    worker_was_running = bool(engine.worker and engine.worker.is_alive())
+    engine.stop_event.set()
+    if worker_was_running and engine.worker:
+        engine.worker.join(timeout=max(5.0, POLL_SECONDS + 2.0))
+        if engine.worker.is_alive():
+            raise HTTPException(status_code=503, detail="Collector is busy; retry reset shortly")
+
+    firestore_deleted = 0
+    try:
+        # Delete permanent storage first. If this fails, keep the SQLite cache
+        # intact so a partial reset cannot silently repopulate Firestore later.
+        if FIRESTORE_ENABLED:
+            for collection_name in ("rounds", "predictions", "flash_live_bets"):
+                firestore_deleted += _delete_firestore_collection(collection_name)
+
+        with engine._connect() as conn:
+            counts = {
+                "rounds": int(conn.execute("SELECT COUNT(*) FROM rounds").fetchone()[0]),
+                "predictions": int(conn.execute("SELECT COUNT(*) FROM predictions").fetchone()[0]),
+                "flash_live_bets": int(conn.execute("SELECT COUNT(*) FROM flash_live_bets").fetchone()[0]),
+            }
+            conn.execute("DELETE FROM flash_live_bets")
+            conn.execute("DELETE FROM predictions")
+            conn.execute("DELETE FROM rounds")
+            conn.commit()
+        engine.last_seen_issue = None
+        engine.last_error = None
+        engine.last_api_ok_at = None
+        engine.last_poll_at = None
+        logger.warning("all prediction data reset by authenticated admin")
+        return {
+            "ok": True,
+            "deleted": counts,
+            "firestore_documents_deleted": firestore_deleted,
+            "internal_collector_restarted": bool(ENABLE_INTERNAL_COLLECTOR),
+        }
+    finally:
+        if ENABLE_INTERNAL_COLLECTOR:
+            engine.start_worker()
+
+
 @app.get("/api/v9.5/flash")
 @app.get("/api/v9.4/flash")
 @app.get("/api/v9.3/flash")
@@ -2086,6 +2449,10 @@ def v93_simulate(
     target_balance: float = Query(..., gt=0, le=1000000000),
     stake_percent: float = Query(2.0, ge=0.1, le=5.0),
     max_rounds: int = Query(200, ge=10, le=1000),
+    stake_mode: str = Query("percent", pattern="^(percent|flat)$"),
+    flat_stake: float = Query(10.0, gt=0, le=100000000),
+    stop_loss_percent: float = Query(30.0, ge=0, le=100),
+    max_consecutive_losses: int = Query(0, ge=0, le=100),
 ):
     history = engine.load_history(max(HISTORY_LIMIT, max_rounds + V93_MIN_TRAIN + 20))
     return simulate_v93_virtual_balance(
@@ -2094,6 +2461,10 @@ def v93_simulate(
         target_balance=target_balance,
         stake_percent=stake_percent / 100.0,
         max_rounds=max_rounds,
+        stake_mode=stake_mode,
+        flat_stake=flat_stake,
+        stop_loss_percent=stop_loss_percent,
+        max_consecutive_losses=max_consecutive_losses,
     )
 
 
@@ -2143,7 +2514,7 @@ def ingest_round(
         # Rebuild the cache BEFORE inserting/predicting.
 
 
-        if engine.count_rounds() == 0:
+        if FIRESTORE_ENABLED and engine.count_rounds() == 0:
 
 
             restored_from_firestore = engine.hydrate_rounds_firestore(HISTORY_LIMIT)
@@ -2171,19 +2542,12 @@ def ingest_round(
     live_settled = _settle_flash_live_bet(game)
 
 
-    try:
-
-
-        # Firestore is the permanent source of truth across deployments.
-
-
-        engine.persist_round_firestore(game)
-
-
-    except Exception as exc:
-
-
-        firebase_error = f"persist: {type(exc).__name__}: {exc}"
+    if FIRESTORE_ENABLED:
+        try:
+            # Firestore is the permanent source of truth across deployments.
+            engine.persist_round_firestore(game)
+        except Exception as exc:
+            firebase_error = f"persist: {type(exc).__name__}: {exc}"
 
 
 
@@ -2209,5 +2573,5 @@ def ingest_round(
         "live_flash_settled": live_settled,
         "restored_from_firestore": restored_from_firestore,
         "firebase_error": firebase_error,
-        "storage": "firestore-persistent/sqlite-cache",
+        "storage": "firestore-persistent/sqlite-cache" if FIRESTORE_ENABLED else "local-sqlite",
     }

@@ -3,122 +3,659 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>WinGo V9.5 Flash Live</title>
+<meta name="theme-color" content="#060912">
+<title>WinGo V9.5.3 Flash Live</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&display=swap" rel="stylesheet">
 <style>
-:root{--bg:#060912;--card:#0d1420;--card2:#101a29;--line:#223049;--text:#f4f7fb;--muted:#8da0bd;--blue:#4aa3ff;--green:#28d17c;--red:#ff5d6c;--yellow:#ffc857;--violet:#ad7cff}
-*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 15% 0,#132039 0,#060912 42%);color:var(--text);font-family:Inter,system-ui,Arial,sans-serif}.wrap{max-width:1280px;margin:auto;padding:18px}.top{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:14px;flex-wrap:wrap}h1{margin:0;font-size:24px;letter-spacing:.06em}.muted,.sub{color:var(--muted);font-size:12px}.badge{display:inline-flex;align-items:center;padding:7px 10px;border:1px solid var(--line);border-radius:999px;background:#0a101a;font:12px ui-monospace,monospace}.grid{display:grid;grid-template-columns:repeat(6,1fr);gap:10px}.card{background:linear-gradient(180deg,var(--card2),var(--card));border:1px solid var(--line);border-radius:16px;padding:16px;box-shadow:0 16px 40px #0005}.label{color:#91aee0;font-size:11px;letter-spacing:.12em;text-transform:uppercase}.value{font-size:27px;font-weight:850;margin-top:6px}.two{display:grid;grid-template-columns:1.15fr .85fr;gap:10px;margin-top:10px}.signal{font-size:48px;font-weight:900;margin:8px 0}.big{color:var(--yellow)}.small{color:var(--blue)}.win{color:var(--green)}.loss{color:var(--red)}.pending{color:var(--yellow)}.bar{height:10px;background:#07101a;border:1px solid var(--line);border-radius:99px;overflow:hidden;margin-top:8px}.bar>div{height:100%;background:linear-gradient(90deg,var(--blue),var(--green));width:0}.metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-top:12px}.metric{background:#09111c;border:1px solid var(--line);border-radius:12px;padding:11px}.metric span{display:block;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.08em}.metric b{display:block;font-size:19px;margin-top:5px}.section{margin-top:10px}.section h2{font-size:14px;letter-spacing:.08em;text-transform:uppercase;margin:0 0 10px}.models .row{display:grid;grid-template-columns:135px 1fr 62px;gap:10px;align-items:center;margin:10px 0;font-size:12px}.mini{height:8px;background:#07101a;border-radius:999px;overflow:hidden}.mini i{display:block;height:100%;background:var(--blue)}.compare{display:grid;grid-template-columns:repeat(5,1fr);gap:8px}.box{padding:12px;border:1px solid var(--line);border-radius:12px;background:#09111c}.box span{display:block;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.08em}.box b{display:block;font-size:23px;margin-top:5px}.wlbar{height:12px;border-radius:99px;overflow:hidden;background:#151d2a;display:flex;margin:13px 0 8px}.wpart{background:var(--green)}.lpart{background:var(--red)}.strip{display:flex;gap:6px;flex-wrap:wrap;margin-top:12px}.dot{min-width:32px;height:30px;border-radius:8px;display:grid;place-items:center;font:800 11px ui-monospace,monospace;border:1px solid var(--line);padding:0 7px}.dot.w{color:var(--green);background:#28d17c15;border-color:#28d17c55}.dot.l{color:var(--red);background:#ff5d6c15;border-color:#ff5d6c55}.dot.p{color:var(--yellow);background:#ffc85710;border-color:#ffc85755}.livebox{border:1px solid #2b476d;background:linear-gradient(135deg,#0c1624,#0a111b);border-radius:14px;padding:14px;margin-top:12px}.livepred{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}.livepred .pick{font-size:30px;font-weight:900}.note{padding:10px 12px;border:1px solid var(--line);border-radius:10px;background:#08111b;color:var(--muted);font-size:12px;margin-top:10px}.warns{margin-top:8px}.warn{display:inline-block;padding:4px 8px;border:1px solid var(--line);border-radius:999px;color:var(--muted);font-size:11px;margin:3px 3px 0 0}table{width:100%;border-collapse:collapse;font-size:12px}th,td{padding:9px 7px;border-bottom:1px solid var(--line);text-align:left}th{color:var(--muted)}.scroll{overflow:auto}.err{color:var(--red)}.api-config{display:flex;gap:7px;align-items:center;width:100%;justify-content:flex-end}.api-config input{width:min(430px,100%);background:#08111b;color:var(--text);border:1px solid var(--line);border-radius:9px;padding:8px 10px}.api-config button{background:#18304d;color:var(--text);border:1px solid #31557d;border-radius:9px;padding:8px 12px;cursor:pointer}
-@media(max-width:1050px){.grid{grid-template-columns:repeat(3,1fr)}.compare{grid-template-columns:repeat(3,1fr)}}@media(max-width:800px){.two{grid-template-columns:1fr}.metrics{grid-template-columns:1fr 1fr}.grid{grid-template-columns:1fr 1fr}.compare{grid-template-columns:1fr 1fr}.wrap{padding:11px}}@media(max-width:480px){.grid,.metrics,.compare{grid-template-columns:1fr}.signal{font-size:40px}}
+/* ═══ SEMANTIC DESIGN TOKENS (Pro-tip #6) ═══ */
+:root{
+  --bg:#060912;
+  --surface:#0d1420; --surface-2:#101a29; --surface-3:#09111c;
+  --line:#1f2d47; --line-strong:#2b476d; --row-hover:#13203a;
+  --text:#f4f7fb; --text-2:#dce6f7; --muted:#8da0bd;
+  --primary:#4aa3ff; --info:#22d3ee; --success:#28d17c;
+  --danger:#ff5d6c; --warning:#ffc857; --violet:#ad7cff;
+  --radius:16px;
+}
+*{box-sizing:border-box}
+body{margin:0;background:radial-gradient(circle at 15% 0,#132039 0,var(--bg) 42%);color:var(--text);font-family:Inter,system-ui,Arial,sans-serif;-webkit-font-smoothing:antialiased}
+.wrap{max-width:1280px;margin:auto;padding:20px}
+
+/* ── Top bar ── */
+.top{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:16px;flex-wrap:wrap}
+h1{margin:0;font-size:22px;font-weight:700;letter-spacing:.06em}
+.muted,.sub{color:var(--muted);font-size:12px}
+.badge{display:inline-flex;align-items:center;gap:8px;padding:7px 12px;border:1px solid var(--line);border-radius:999px;background:#0a101a;font:600 11px ui-monospace,monospace;letter-spacing:.06em}
+.badge .pulse{width:8px;height:8px;border-radius:50%;background:var(--success);animation:pulse 1.6s ease-in-out infinite}
+.badge.err{border-color:rgba(255,93,108,.5);color:var(--danger)}
+.badge.err .pulse{background:var(--danger)}
+@keyframes pulse{50%{opacity:.3}}
+
+/* ── Cards: subtle depth gradient (Point #1) ── */
+.card{position:relative;background:linear-gradient(180deg,rgba(255,255,255,.03),rgba(255,255,255,0) 55%),var(--surface);border:1px solid var(--line);border-radius:var(--radius);padding:18px;box-shadow:0 16px 40px rgba(0,0,0,.35);transition:border-color .25s ease}
+.card:hover{border-color:#2a3d5f}
+.label{color:var(--muted);font-size:11px;font-weight:600;letter-spacing:.12em;text-transform:uppercase}
+.label.strong{color:var(--text-2)} /* important labels bright (Point #1) */
+.value{font-size:26px;font-weight:700;margin-top:6px;font-variant-numeric:tabular-nums} /* 700 not 850 */
+.value.sm{font-size:18px}
+
+/* ── HERO: neon glow (Point #2) ── */
+.signal{font-size:46px;font-weight:800;letter-spacing:.04em;line-height:1.1;margin:10px 0 6px;transition:color .3s,text-shadow .3s}
+.signal.big{color:var(--warning);text-shadow:0 0 16px rgba(255,200,87,.55),0 0 55px rgba(255,200,87,.22)}   /* BIG → gold glow */
+.signal.small{color:var(--info);text-shadow:0 0 16px rgba(34,211,238,.55),0 0 55px rgba(34,211,238,.2)}     /* SMALL → cyan glow */
+.hero.glow-big{border-color:rgba(255,200,87,.4);box-shadow:0 0 0 1px rgba(255,200,87,.14),0 0 45px rgba(255,200,87,.08),0 16px 40px rgba(0,0,0,.35)}
+.hero.glow-small{border-color:rgba(34,211,238,.4);box-shadow:0 0 0 1px rgba(34,211,238,.14),0 0 45px rgba(34,211,238,.08),0 16px 40px rgba(0,0,0,.35)}
+.hero-head{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;flex-wrap:wrap}
+
+/* Circular SVG confidence dial (Point #2) */
+.dial{position:relative;width:128px;height:128px;flex:none}
+.dial svg{width:100%;height:100%;transform:rotate(-90deg)}
+.dial .track{fill:none;stroke:#0a1322;stroke-width:10}
+.dial .meter{fill:none;stroke:var(--primary);stroke-width:10;stroke-linecap:round;stroke-dasharray:327;stroke-dashoffset:327;transition:stroke-dashoffset .9s cubic-bezier(.22,.8,.3,1),stroke .4s}
+.dial-center{position:absolute;inset:0;display:grid;place-content:center;text-align:center;gap:2px}
+.dial-center b{font-size:23px;font-weight:800;font-variant-numeric:tabular-nums}
+.dial-center span{font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:.14em}
+
+/* Skeleton shimmer (Point #5) */
+.skeleton{position:relative;overflow:hidden;background:#0a1322!important;border-radius:8px;color:transparent!important;text-shadow:none!important;user-select:none;pointer-events:none}
+.skeleton::after{content:"";position:absolute;inset:0;background:linear-gradient(90deg,transparent,rgba(148,180,255,.09),transparent);animation:shimmer 1.4s infinite}
+@keyframes shimmer{from{transform:translateX(-100%)}to{transform:translateX(100%)}}
+
+/* ── Bars: color-coded by value (Point #3) ── */
+.mini{position:relative;height:8px;background:#07101a;border-radius:99px;overflow:hidden}
+.mini::after{content:"";position:absolute;left:50%;top:0;bottom:0;width:1px;background:rgba(255,255,255,.14)}
+.mini i{display:block;height:100%;width:0;border-radius:99px;transition:width .7s cubic-bezier(.22,.8,.3,1)}
+
+/* Regime dot (Point #3) */
+.regime{display:flex;align-items:center;gap:9px;margin-top:6px}
+.rdot{width:9px;height:9px;border-radius:50%;background:var(--muted);flex:none;transition:.3s}
+.rdot.ok{background:var(--success);box-shadow:0 0 10px rgba(40,209,124,.7)}
+.rdot.warn{background:var(--warning);box-shadow:0 0 10px rgba(255,200,87,.7)}
+.rdot.bad{background:var(--danger);box-shadow:0 0 10px rgba(255,93,108,.7);animation:pulse 1.1s infinite}
+
+/* Signal-strength bars for Agreement (Point #3) */
+.sigbars{display:inline-flex;align-items:flex-end;gap:3px;height:16px;margin-top:8px}
+.sigbars i{width:5px;border-radius:2px;background:#22314c;transition:.3s}
+.sigbars i:nth-child(1){height:6px}.sigbars i:nth-child(2){height:11px}.sigbars i:nth-child(3){height:16px}
+.sigbars[data-level="1"] i:nth-child(1){background:var(--danger);box-shadow:0 0 8px rgba(255,93,108,.5)}
+.sigbars[data-level="2"] i:nth-child(-n+2){background:var(--warning);box-shadow:0 0 8px rgba(255,200,87,.5)}
+.sigbars[data-level="3"] i{background:var(--success);box-shadow:0 0 8px rgba(40,209,124,.5)}
+
+/* ── Grids & metrics ── */
+.grid{display:grid;grid-template-columns:repeat(6,1fr);gap:12px}
+.two{display:grid;grid-template-columns:1.15fr .85fr;gap:12px;margin-top:12px}
+.metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-top:14px}
+.metric{background:var(--surface-3);border:1px solid var(--line);border-radius:12px;padding:11px;transition:border-color .2s}
+.metric:hover{border-color:#2a3d5f}
+.metric span{display:block;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.08em}
+.metric b{display:block;font-size:18px;font-weight:700;margin-top:5px;font-variant-numeric:tabular-nums}
+.section{margin-top:14px}
+.section h2{display:flex;align-items:center;gap:9px;font-size:13px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--text-2);margin:0 0 12px}
+.section h2::before{content:"";width:3px;height:14px;border-radius:2px;background:linear-gradient(180deg,var(--primary),var(--violet))}
+.models .row{display:grid;grid-template-columns:135px 1fr 62px;gap:10px;align-items:center;margin:11px 0;font-size:12px}
+.models .row span{color:var(--text-2)}
+.models .row b{font-variant-numeric:tabular-nums;text-align:right}
+
+.compare{display:grid;grid-template-columns:repeat(5,1fr);gap:8px}
+.box{padding:12px;border:1px solid var(--line);border-radius:12px;background:var(--surface-3)}
+.box span{display:block;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.08em}
+.box b{display:block;font-size:22px;font-weight:700;margin-top:5px;font-variant-numeric:tabular-nums}
+
+.win{color:var(--success)}.loss{color:var(--danger)}.pending{color:var(--warning)}
+.t-big{color:var(--warning)}.t-small{color:var(--info)}
+.wlbar{height:12px;border-radius:99px;overflow:hidden;background:#151d2a;display:flex;margin:14px 0 8px}
+.wpart{background:var(--success);transition:width .6s}.lpart{background:var(--danger);transition:width .6s}
+.strip{display:flex;gap:6px;flex-wrap:wrap;margin-top:12px}
+.dot{min-width:32px;height:30px;border-radius:8px;display:grid;place-items:center;font:700 11px ui-monospace,monospace;border:1px solid var(--line);padding:0 7px}
+.dot.w{color:var(--success);background:rgba(40,209,124,.08);border-color:rgba(40,209,124,.33)}
+.dot.l{color:var(--danger);background:rgba(255,93,108,.08);border-color:rgba(255,93,108,.33)}
+.dot.p{color:var(--warning);background:rgba(255,200,87,.06);border-color:rgba(255,200,87,.33)}
+
+.livebox{border:1px solid var(--line-strong);background:linear-gradient(135deg,#0c1624,#0a111b);border-radius:14px;padding:14px;margin-top:12px}
+.livepred{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
+.pick{font-size:24px;font-weight:800;font-variant-numeric:tabular-nums}
+.pick.big{color:var(--warning);text-shadow:0 0 14px rgba(255,200,87,.45)}
+.pick.small{color:var(--info);text-shadow:0 0 14px rgba(34,211,238,.4)}
+.note{padding:10px 14px;border:1px solid var(--line);border-left:3px solid var(--primary);border-radius:10px;background:#08111b;color:var(--muted);font-size:12px;margin-top:12px}
+.warns{margin-top:8px}
+.warn{display:inline-block;padding:4px 9px;border:1px solid rgba(255,200,87,.35);border-radius:999px;color:var(--warning);background:rgba(255,200,87,.06);font-size:11px;margin:3px 3px 0 0}
+
+/* ── Tables: hover states (Point #4) ── */
+.scroll{overflow:auto;max-height:380px;border:1px solid var(--line);border-radius:10px}
+table{width:100%;border-collapse:collapse;font-size:12px}
+th,td{padding:9px 10px;border-bottom:1px solid var(--line);text-align:left;white-space:nowrap}
+th{position:sticky;top:0;background:var(--surface);color:var(--muted);font-weight:600;text-transform:uppercase;font-size:10px;letter-spacing:.06em;z-index:1}
+tbody tr{transition:background .15s}
+tbody tr:hover{background:var(--row-hover)}
+
+/* ── Forms & buttons ── */
+.api-config{display:flex;gap:7px;align-items:center;justify-content:flex-end;flex:1;min-width:260px;max-width:460px}
+.api-config input{flex:1;background:#08111b;color:var(--text);border:1px solid var(--line);border-radius:9px;padding:8px 10px;font-size:13px}
+input:focus,select:focus{outline:none;border-color:var(--primary);box-shadow:0 0 0 3px rgba(74,163,255,.15)}
+.api-config button,.sim-form button{background:linear-gradient(180deg,#1c3a5e,#152c48);color:var(--text);border:1px solid #31557d;border-radius:9px;padding:9px 14px;cursor:pointer;font:600 13px Inter,system-ui;transition:.2s}
+.api-config button:hover,.sim-form button:hover{border-color:var(--primary);box-shadow:0 0 0 3px rgba(74,163,255,.12)}
+.api-config .danger-btn{background:linear-gradient(180deg,#5b2028,#3e171d);border-color:#8b3541;color:#ffdce0}
+.api-config .danger-btn:hover{border-color:var(--danger);box-shadow:0 0 0 3px rgba(255,93,108,.14)}
+button:disabled{opacity:.55;cursor:wait}
+.sim-form{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin:12px 0}
+.sim-form label{color:var(--muted);font-size:11px;display:block}
+.sim-form input,.sim-form select{display:block;width:100%;margin-top:5px;background:#08111b;color:var(--text);border:1px solid var(--line);border-radius:9px;padding:10px;font-size:13px}
+.sim-action{display:flex;align-items:end}
+.sim-action button{width:100%;font-weight:700}
+
+/* ── Simulator tabs (Point #4) ── */
+.tabs{display:flex;gap:4px;background:var(--surface-3);border:1px solid var(--line);border-radius:10px;padding:4px;width:max-content;margin-bottom:12px}
+.tab{border:0;background:transparent;color:var(--muted);font:600 12px Inter,system-ui;padding:7px 16px;border-radius:7px;cursor:pointer;transition:.2s}
+.tab.active{background:#18304d;color:var(--text)}
+.tabpane{display:none}
+.tabpane.active{display:block}
+.sim-results{display:none}
+.sim-results.show{display:block}
+
+/* ── Empty states (Point #4) ── */
+.empty{display:grid;place-items:center;gap:10px;padding:36px 12px;color:var(--muted);text-align:center}
+.empty svg{width:36px;height:36px;opacity:.45}
+.empty b{color:var(--text-2);font-size:14px}
+
+/* ── Toast / error with Retry (Point #5) ── */
+.toast{position:fixed;left:50%;bottom:18px;transform:translate(-50%,16px);display:flex;gap:12px;align-items:center;background:#180f16;border:1px solid rgba(255,93,108,.45);color:var(--danger);padding:11px 14px;border-radius:12px;font-size:13px;opacity:0;pointer-events:none;transition:.3s;z-index:100;box-shadow:0 12px 32px rgba(0,0,0,.55);max-width:min(92vw,520px)}
+.toast.show{opacity:1;transform:translate(-50%,0);pointer-events:auto}
+.toast button{background:var(--danger);border:0;color:#fff;font:700 12px Inter,system-ui;padding:7px 13px;border-radius:8px;cursor:pointer}
+
+/* ── Mobile tab navigation (Point #5) ── */
+.mtabs{display:none}
+.panel{min-width:0}
+
+@media(max-width:1050px){
+  .grid{grid-template-columns:repeat(3,1fr)}
+  .compare{grid-template-columns:repeat(3,1fr)}
+  .sim-form{grid-template-columns:repeat(2,1fr)}
+}
+@media(max-width:800px){
+  .wrap{padding:12px}
+  .two{grid-template-columns:1fr}
+  .grid{grid-template-columns:1fr 1fr}
+  .metrics{grid-template-columns:1fr 1fr}
+  .compare{grid-template-columns:1fr 1fr}
+  .signal{font-size:40px}
+  .mtabs{display:flex;gap:6px;position:sticky;top:0;z-index:40;background:rgba(7,11,20,.92);backdrop-filter:blur(10px);border:1px solid var(--line);border-radius:12px;padding:6px;margin-bottom:12px}
+  .mtabs button{flex:1;background:transparent;border:0;color:var(--muted);padding:9px 4px;border-radius:9px;font:600 12px Inter,system-ui;cursor:pointer;transition:.2s}
+  .mtabs button.active{background:#18304d;color:var(--text)}
+  .panel{display:none}
+  .panel.active{display:block}
+  .hero-head{flex-direction:column}
+}
+@media(max-width:480px){
+  .grid,.metrics,.compare,.sim-form{grid-template-columns:1fr}
+  .api-config{max-width:100%}
+}
+@media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
 </style>
 </head>
 <body>
 <div class="wrap">
   <div class="top">
-    <div><h1>WINGO V9.5 FLASH LIVE</h1><div class="muted">Chronology-fixed Big/Small research engine · live paper simulator · every-round direction</div></div>
-    <div class="badge" id="status">CONNECTING</div>
-    <form class="api-config" id="apiForm"><input id="apiInput" type="url" aria-label="Backend URL" placeholder="https://your-backend.example.com"><button type="submit">Connect</button></form>
+    <div>
+      <h1>WINGO V9.5.3 FLASH LIVE</h1>
+      <div class="muted">Chronology-fixed Big/Small research engine · calibrated selective signals · live paper simulator</div>
+    </div>
+    <div class="badge" id="status"><span class="pulse"></span><span id="statusText">CONNECTING</span></div>
+    <form class="api-config" id="apiForm">
+      <input id="apiInput" type="url" aria-label="Backend URL" placeholder="https://your-backend.example.com">
+      <button type="submit">Connect</button>
+      <button type="button" class="danger-btn" id="resetDataBtn">Reset Data</button>
+    </form>
   </div>
 
-  <div class="grid">
-    <div class="card"><div class="label">Stored rounds</div><div class="value" id="stored">—</div><div class="sub">Firestore-backed</div></div>
-    <div class="card"><div class="label">OOS accuracy</div><div class="value" id="oos">—</div><div class="sub" id="oosn">walk-forward</div></div>
-    <div class="card"><div class="label">Coverage</div><div class="value" id="coverage">—</div><div class="sub">every-round model</div></div>
-    <div class="card"><div class="label">Quality</div><div class="value" id="quality">—</div><div class="sub">evidence strength</div></div>
-    <div class="card"><div class="label">Agreement</div><div class="value" id="agreement">—</div><div class="sub">3 model votes</div></div>
-    <div class="card"><div class="label">Regime</div><div class="value" id="regime">—</div><div class="sub" id="choppy">choppy score</div></div>
-  </div>
+  <!-- Mobile-only tab navigation -->
+  <nav class="mtabs" id="mtabs">
+    <button type="button" data-panel="p-live" class="active">Live</button>
+    <button type="button" data-panel="p-sim">Fake Wallet</button>
+    <button type="button" data-panel="p-history">History</button>
+  </nav>
 
-  <div class="two">
-    <div class="card">
-      <div class="label">Next round prediction</div>
-      <div class="signal" id="pred">WAIT</div>
-      <div class="sub" id="target">Waiting for history…</div>
-      <div style="margin-top:14px"><div class="label">Calibrated confidence</div><div class="value" id="conf">—</div><div class="bar"><div id="confbar"></div></div></div>
-      <div class="metrics">
-        <div class="metric"><span>P(Big)</span><b id="pbig">—</b></div>
-        <div class="metric"><span>P(Small)</span><b id="psmall">—</b></div>
-        <div class="metric"><span>Edge</span><b id="edge">—</b></div>
-        <div class="metric"><span>Support</span><b id="support">—</b></div>
+  <!-- ═══ PANEL: LIVE ═══ -->
+  <section class="panel active" id="p-live">
+    <div class="grid">
+      <div class="card"><div class="label">Stored rounds</div><div class="value skeleton" id="stored">—</div><div class="sub" id="storage">Storage</div></div>
+      <div class="card"><div class="label">OOS accuracy</div><div class="value skeleton" id="oos">—</div><div class="sub" id="oosn">walk-forward</div></div>
+      <div class="card"><div class="label">Coverage</div><div class="value skeleton" id="coverage">—</div><div class="sub">selective confidence gate</div></div>
+      <div class="card"><div class="label">Quality</div><div class="value skeleton" id="quality">—</div><div class="sub">evidence strength</div></div>
+      <div class="card"><div class="label">Agreement</div><div class="value sm skeleton" id="agreement">—</div><div class="sigbars" id="sigbars" data-level="0"><i></i><i></i><i></i></div><div class="sub">3 model votes</div></div>
+      <div class="card"><div class="label">Regime</div><div class="regime"><span class="rdot" id="regimeDot"></span><div class="value sm skeleton" id="regime">—</div></div><div class="sub" id="choppy">choppy score</div></div>
+    </div>
+
+    <div class="two">
+      <!-- HERO prediction card -->
+      <div class="card hero" id="heroCard">
+        <div class="hero-head">
+          <div>
+            <div class="label strong">Next round prediction</div>
+            <div class="signal skeleton" id="pred">WAIT</div>
+            <div class="sub skeleton" id="target">Waiting for history…</div>
+          </div>
+          <!-- Circular confidence meter (SVG) -->
+          <div class="dial">
+            <svg viewBox="0 0 120 120" aria-hidden="true">
+              <circle class="track" cx="60" cy="60" r="52"/>
+              <circle class="meter" id="confArc" cx="60" cy="60" r="52"/>
+            </svg>
+            <div class="dial-center"><b id="conf">—</b><span>confidence</span></div>
+          </div>
+        </div>
+        <div class="metrics">
+          <div class="metric"><span>P(Big)</span><b id="pbig">—</b></div>
+          <div class="metric"><span>P(Small)</span><b id="psmall">—</b></div>
+          <div class="metric"><span>Edge</span><b id="edge">—</b></div>
+          <div class="metric"><span>Support</span><b id="support">—</b></div>
+        </div>
+        <div class="warns" id="warnings"></div>
       </div>
-      <div class="warns" id="warnings"></div>
-    </div>
 
-    <div class="card models">
-      <div class="label">Model probabilities · P(Big)</div>
-      <div id="models"></div>
-      <div class="metrics">
-        <div class="metric"><span>Entropy</span><b id="entropy">—</b></div>
-        <div class="metric"><span>Switch rate</span><b id="switch">—</b></div>
-        <div class="metric"><span>Stability</span><b id="stability">—</b></div>
-        <div class="metric"><span>Calibration</span><b id="calWeight">—</b></div>
+      <div class="card models">
+        <div class="label">Model probabilities · P(Big)</div>
+        <div id="models"></div>
+        <div class="metrics">
+          <div class="metric"><span>Entropy</span><b id="entropy">—</b></div>
+          <div class="metric"><span>Switch rate</span><b id="switch">—</b></div>
+          <div class="metric"><span>Stability</span><b id="stability">—</b></div>
+          <div class="metric"><span>Calibration</span><b id="calWeight">—</b></div>
+        </div>
       </div>
     </div>
-  </div>
 
-  <div class="card section">
-    <h2>Live Paper Simulator</h2>
-    <div class="sub">Backend automatically opens one virtual-unit paper prediction for the next issue and settles it when that result arrives. No SKIP.</div>
-    <div class="livebox">
-      <div class="livepred">
-        <div><div class="label">Pending issue</div><div class="pick" id="liveIssue">—</div></div>
-        <div><div class="label">Paper prediction</div><div class="pick" id="livePick">—</div></div>
-        <div><div class="label">Confidence</div><div class="pick" id="liveConf">—</div></div>
-        <div><div class="label">Quality</div><div class="pick" id="liveQuality">—</div></div>
+    <div class="card section">
+      <h2>Live Paper Simulator</h2>
+      <div class="sub">Backend opens a paper prediction only when confidence and regime filters pass, then settles it when that result arrives. Low-edge rounds are SKIP.</div>
+      <div class="livebox">
+        <div class="livepred">
+          <div><div class="label">Pending issue</div><div class="pick skeleton" id="liveIssue">—</div></div>
+          <div><div class="label">Paper prediction</div><div class="pick skeleton" id="livePick">—</div></div>
+          <div><div class="label">Confidence</div><div class="pick skeleton" id="liveConf">—</div></div>
+          <div><div class="label">Quality</div><div class="pick skeleton" id="liveQuality">—</div></div>
+        </div>
+      </div>
+      <div class="compare" style="margin-top:12px">
+        <div class="box"><span>Wins</span><b class="win" id="wins">0</b></div>
+        <div class="box"><span>Losses</span><b class="loss" id="losses">0</b></div>
+        <div class="box"><span>Hit Rate</span><b id="hit">—</b></div>
+        <div class="box"><span>Settled</span><b id="settled">0</b></div>
+        <div class="box"><span>Current Streak</span><b id="streak">—</b></div>
+      </div>
+      <div class="wlbar"><div class="wpart" id="wbar" style="width:0%"></div><div class="lpart" id="lbar" style="width:0%"></div></div>
+      <div class="strip" id="strip"></div>
+      <div class="note">This is paper simulation only. Confidence is not artificially boosted: 50–55% can be the honest output when the history has little predictive signal.</div>
+    </div>
+  </section>
+
+  <!-- ═══ PANEL: LIVE FAKE WALLET ═══ -->
+  <section class="panel" id="p-sim">
+    <div class="card section" id="walletCard" style="margin-top:12px">
+      <h2>Live Fake Balance</h2>
+      <div class="sub">Enter a fake balance and base stake. The page applies each live prediction as a 1:1 paper bet: after a loss the next amount doubles, and after a win it resets to the base stake. No real wallet or bet is connected.</div>
+      <form class="sim-form" id="walletForm">
+        <label>Current fake balance (PKR)<input id="walletStart" type="number" value="1000" min="1" step="0.01" required></label>
+        <label>Base fake bet (PKR)<input id="walletBase" type="number" value="10" min="0.01" step="0.01" required></label>
+        <label>Maximum doubling steps<input id="walletMaxSteps" type="number" value="6" min="1" max="12" step="1" required><span class="sub">Session pauses at this safety limit</span></label>
+        <div class="sim-action"><button id="walletStartBtn" type="submit">Start / Reset Fake Session</button></div>
+      </form>
+      <div class="note" id="walletMessage">The session starts from the next live prediction; older results are not counted.</div>
+      <div class="compare" style="margin-top:12px">
+        <div class="box"><span>Fake Balance</span><b id="walletBalance">—</b></div>
+        <div class="box"><span>Next Fake Bet</span><b id="walletNextStake">—</b></div>
+        <div class="box"><span>Total P / L</span><b id="walletPnl">—</b></div>
+        <div class="box"><span>Total Wagered</span><b id="walletWagered">—</b></div>
+        <div class="box"><span>Session</span><b id="walletStatus" style="font-size:14px">NOT STARTED</b></div>
+      </div>
+      <div class="livebox">
+        <div class="livepred">
+          <div><div class="label">Pending issue</div><div class="pick" id="walletIssue">—</div></div>
+          <div><div class="label">Prediction</div><div class="pick" id="walletPick">—</div></div>
+          <div><div class="label">Planned fake bet</div><div class="pick" id="walletPlannedStake">—</div></div>
+          <div><div class="label">Doubling step</div><div class="pick" id="walletStep">0</div></div>
+        </div>
+      </div>
+      <div class="scroll" style="margin-top:12px">
+        <table><thead><tr><th>Issue</th><th>Prediction</th><th>Actual</th><th>Fake Bet</th><th>P / L</th><th>Fake Balance</th><th>Step</th><th>Result</th></tr></thead>
+        <tbody id="walletRows"><tr><td colspan="8">Start a fake session to record live paper bets.</td></tr></tbody></table>
       </div>
     </div>
-    <div class="compare" style="margin-top:10px">
-      <div class="box"><span>Wins</span><b class="win" id="wins">0</b></div>
-      <div class="box"><span>Losses</span><b class="loss" id="losses">0</b></div>
-      <div class="box"><span>Hit Rate</span><b id="hit">—</b></div>
-      <div class="box"><span>Settled</span><b id="settled">0</b></div>
-      <div class="box"><span>Current Streak</span><b id="streak">—</b></div>
-    </div>
-    <div class="wlbar"><div class="wpart" id="wbar" style="width:0%"></div><div class="lpart" id="lbar" style="width:0%"></div></div>
-    <div class="strip" id="strip"></div>
-    <div class="note">This is paper simulation only. Confidence is not artificially boosted: 50–55% can be the honest output when the history has little predictive signal.</div>
-  </div>
+  </section>
 
-  <div class="two">
-    <div class="card section"><h2>Live Win / Loss History</h2><div class="scroll"><table><thead><tr><th>Issue</th><th>Prediction</th><th>Actual</th><th>Confidence</th><th>Quality</th><th>Result</th></tr></thead><tbody id="liveRows"><tr><td colspan="6">Waiting…</td></tr></tbody></table></div></div>
-    <div class="card section"><h2>Recent Completed Rounds</h2><div class="scroll"><table><thead><tr><th>Issue</th><th>#</th><th>Size</th><th>Color</th></tr></thead><tbody id="roundRows"><tr><td colspan="4">Loading…</td></tr></tbody></table></div></div>
-  </div>
+  <!-- ═══ PANEL: HISTORY ═══ -->
+  <section class="panel" id="p-history">
+    <div class="two" style="margin-top:12px">
+      <div class="card section">
+        <h2>Live Win / Loss History</h2>
+        <div class="scroll">
+          <table><thead><tr><th>Issue</th><th>Prediction</th><th>Actual</th><th>Confidence</th><th>Quality</th><th>Fake Bet</th><th>P / L</th><th>Fake Balance</th><th>Result</th></tr></thead>
+          <tbody id="liveRows"><tr><td colspan="9"><div class="empty"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg><b>Waiting for first round…</b><div class="sub">Data coming soon — predictions appear here automatically.</div></div></td></tr></tbody></table>
+        </div>
+      </div>
+      <div class="card section">
+        <h2>Recent Completed Rounds</h2>
+        <div class="scroll">
+          <table><thead><tr><th>Issue</th><th>#</th><th>Size</th><th>Color</th></tr></thead>
+          <tbody id="roundRows"><tr><td colspan="4">Loading…</td></tr></tbody></table>
+        </div>
+      </div>
+    </div>
+  </section>
 </div>
+
+<!-- Toast: Connection Lost + Retry (Point #5) -->
+<div class="toast" id="toast">
+  <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M2 2l20 20M8.5 16.4a5 5 0 0 1 6.4-.2M5 12.5a10 10 0 0 1 3.2-2M15.8 10.6a10 10 0 0 1 3.2 1.9M12 20h.01M2 8.8a15 15 0 0 1 4.7-3M12 5a15 15 0 0 1 7.3 3.8"/></svg>
+  <span id="toastMsg"></span>
+  <button id="toastRetry" type="button">Retry</button>
+</div>
+
 <script>
 const $=id=>document.getElementById(id);
 const q=new URLSearchParams(location.search);
 const requestedApi=q.get('api');
 const API=(requestedApi||localStorage.getItem('wingo_api')||'https://wingo-v8-cloud.onrender.com').trim().replace(/\/$/,'');
 if(requestedApi)localStorage.setItem('wingo_api',API);
-$('apiInput').value=API;
-$('apiForm').addEventListener('submit',e=>{e.preventDefault();try{const value=new URL($('apiInput').value.trim());if(!/^https?:$/.test(value.protocol))throw Error();localStorage.setItem('wingo_api',value.href.replace(/\/$/,''));location.reload()}catch{$('status').textContent='INVALID BACKEND URL';$('status').className='badge err'}});
+ $('apiInput').value=API;
+
+ $('apiForm').addEventListener('submit',e=>{
+  e.preventDefault();
+  try{
+    const value=new URL($('apiInput').value.trim());
+    if(!/^https?:$/.test(value.protocol))throw Error();
+    localStorage.setItem('wingo_api',value.href.replace(/\/$/,''));
+    location.reload();
+  }catch{
+    $('statusText').textContent='INVALID URL';
+    $('status').classList.add('err');
+  }
+ });
+
+$('resetDataBtn').addEventListener('click',async()=>{
+  const accepted=confirm('Delete ALL rounds, predictions and live history from SQLite and Firestore? This cannot be undone.');
+  if(!accepted)return;
+  const adminSecret=prompt('Enter ADMIN_RESET_SECRET to confirm permanent deletion:');
+  if(!adminSecret)return;
+  const button=$('resetDataBtn');button.disabled=true;button.textContent='Resetting…';
+  try{
+    const response=await fetch(`${API}/api/admin/reset-data`,{
+      method:'POST',
+      headers:{'Content-Type':'application/json','X-Admin-Secret':adminSecret},
+      body:JSON.stringify({confirmation:'DELETE ALL DATA'}),
+      signal:AbortSignal.timeout(30000),
+    });
+    const result=await response.json().catch(()=>({}));
+    if(!response.ok)throw Error(result.detail||`HTTP ${response.status}`);
+    localStorage.removeItem(WALLET_KEY);
+    alert(`Reset complete. Deleted ${result.deleted?.rounds||0} rounds and ${result.deleted?.predictions||0} predictions.`);
+    location.reload();
+  }catch(error){
+    toast(`Reset failed: ${error.message}`);
+    button.disabled=false;button.textContent='Reset Data';
+  }
+});
+
 const pct=v=>v==null?'—':(Number(v)*100).toFixed(1)+'%';
 const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-function modelRow(name,p){const x=Math.max(0,Math.min(1,Number(p||0)));return `<div class="row"><span>${name}</span><div class="mini"><i style="width:${x*100}%"></i></div><b>${(x*100).toFixed(1)}%</b></div>`}
+const money=v=>`₨ ${Number(v||0).toFixed(2)}`;
+const WALLET_KEY='wingo_live_fake_wallet_v1';
+const walletDefaults=()=>({active:false,startingBalance:0,balance:0,baseStake:0,nextStake:0,maxSteps:6,lossStreak:0,lastProcessedIssue:'',totalWagered:0,wins:0,losses:0,stoppedReason:'',ledger:[]});
+function loadWallet(){
+  try{
+    const saved=JSON.parse(localStorage.getItem(WALLET_KEY)||'null');
+    return saved&&typeof saved==='object'?{...walletDefaults(),...saved,ledger:Array.isArray(saved.ledger)?saved.ledger:[]}:walletDefaults();
+  }catch{return walletDefaults();}
+}
+let wallet=loadWallet(),latestLiveSnapshot=null;
+const cleanIssue=v=>(String(v??'').replace(/^0+/,'')||'0');
+function compareIssue(a,b){const x=cleanIssue(a),y=cleanIssue(b);return x.length!==y.length?x.length-y.length:(x<y?-1:x>y?1:0);}
+function saveWallet(){localStorage.setItem(WALLET_KEY,JSON.stringify(wallet));}
+
+function processWalletSettlements(s){
+  latestLiveSnapshot=s;
+  if(!wallet.active)return;
+  const settled=(s?.history||[]).filter(x=>x?.result==='WIN'||x?.result==='LOSS').slice().sort((a,b)=>compareIssue(a.issue,b.issue));
+  let changed=false;
+  for(const x of settled){
+    if(compareIssue(x.issue,wallet.lastProcessedIssue)<=0)continue;
+    const stake=Number(wallet.nextStake||wallet.baseStake),step=Number(wallet.lossStreak||0);
+    if(!(stake>0)||Number(wallet.balance)<stake){
+      wallet.active=false;wallet.stoppedReason='Insufficient fake balance for the next stake';changed=true;break;
+    }
+    const win=x.result==='WIN',pnl=win?stake:-stake;
+    wallet.balance=Number(wallet.balance)+pnl;
+    wallet.totalWagered=Number(wallet.totalWagered)+stake;
+    wallet.lastProcessedIssue=String(x.issue||'');
+    if(win){
+      wallet.wins+=1;wallet.lossStreak=0;wallet.nextStake=Number(wallet.baseStake);
+    }else{
+      wallet.losses+=1;wallet.lossStreak=step+1;wallet.nextStake=stake*2;
+    }
+    wallet.ledger.unshift({issue:String(x.issue||''),prediction:x.prediction,actual:x.actual,confidence:x.confidence,quality:x.quality,stake,pnl,balance:wallet.balance,result:x.result,step});
+    wallet.ledger=wallet.ledger.slice(0,250);
+    changed=true;
+    if(wallet.balance<=0){wallet.active=false;wallet.stoppedReason='Fake balance depleted';break;}
+    if(!win&&wallet.lossStreak>=Number(wallet.maxSteps)){
+      wallet.active=false;wallet.stoppedReason=`Stopped at the ${wallet.maxSteps}-step doubling safety limit`;break;
+    }
+    if(!win&&wallet.balance<wallet.nextStake){
+      wallet.active=false;wallet.stoppedReason='Insufficient fake balance for the doubled stake';break;
+    }
+  }
+  if(changed)saveWallet();
+}
+
+function renderWallet(s){
+  const p=s?.pending_prediction||null,pnl=Number(wallet.balance)-Number(wallet.startingBalance);
+  $('walletBalance').textContent=money(wallet.balance);
+  $('walletNextStake').textContent=wallet.active?money(wallet.nextStake):'—';
+  $('walletPnl').textContent=`${pnl>0?'+':''}${money(pnl)}`;
+  $('walletPnl').className=pnl>0?'win':pnl<0?'loss':'';
+  $('walletWagered').textContent=money(wallet.totalWagered);
+  $('walletStatus').textContent=wallet.active?'ACTIVE':wallet.stoppedReason?'PAUSED':'NOT STARTED';
+  $('walletStatus').className=wallet.active?'win':wallet.stoppedReason?'pending':'';
+  $('walletIssue').textContent=p?.issue||'—';
+  $('walletPick').textContent=p?String(p.prediction||'—').toUpperCase():'—';
+  $('walletPick').className='pick'+(p?.prediction==='big'?' big':p?.prediction==='small'?' small':'');
+  $('walletPlannedStake').textContent=wallet.active&&p?money(wallet.nextStake):'—';
+  $('walletStep').textContent=wallet.active?`${wallet.lossStreak}/${wallet.maxSteps}`:'—';
+  $('walletMessage').textContent=wallet.active
+    ?`Paper session active · ${wallet.wins} wins / ${wallet.losses} losses · waiting for issue ${p?.issue||'next'}`
+    :wallet.stoppedReason||'Enter your current balance to begin a local fake-money session.';
+  $('walletRows').innerHTML=wallet.ledger.map(x=>`<tr><td>${esc(x.issue)}</td><td>${esc(String(x.prediction||'—').toUpperCase())}</td><td>${esc(String(x.actual||'—').toUpperCase())}</td><td>${money(x.stake)}</td><td class="${x.pnl>=0?'win':'loss'}"><b>${x.pnl>=0?'+':''}${money(x.pnl)}</b></td><td>${money(x.balance)}</td><td>${x.step}</td><td class="${x.result==='WIN'?'win':'loss'}"><b>${esc(x.result)}</b></td></tr>`).join('')||'<tr><td colspan="8">No fake bets settled in this session yet.</td></tr>';
+}
+
+/* ── Helpers ── */
+const ARC=2*Math.PI*52; // dial circumference
+const levelColor=v=>v<.35?'var(--danger)':v<.55?'var(--warning)':v<.75?'var(--primary)':'var(--success)'; // red→yellow→blue→green
+const skel=(el,on)=>el&&el.classList.toggle('skeleton',!!on);
+
+function setDial(v){
+  const x=Math.max(0,Math.min(1,Number(v||0)));
+  const arc=$('confArc');
+  arc.style.strokeDashoffset=(ARC*(1-x)).toFixed(1);
+  arc.style.stroke=levelColor(x);
+}
+function setRegime(name,choppy){
+  const c=Number(choppy||0),n=String(name||'').toLowerCase();
+  $('regimeDot').className='rdot '+(/chop|chaos|random|unstable/.test(n)||c>.6?'bad':c>.35?'warn':'ok');
+  $('regime').textContent=name||'—';
+  $('choppy').textContent=`choppy ${pct(choppy)} · ${c>.6?'signals less reliable':c>.35?'mixed conditions':'stable conditions'}`;
+}
+function setAgreement(v){
+  const m=String(v??'').match(/\d/);
+  $('sigbars').dataset.level=m?Math.max(0,Math.min(3,Number(m[0]))):0;
+  $('agreement').textContent=v||'—';
+}
+function modelRow(name,p){
+  const x=Math.max(0,Math.min(1,Number(p||0)));
+  return `<div class="row"><span>${esc(name)}</span><div class="mini"><i style="width:${(x*100).toFixed(1)}%;background:linear-gradient(90deg,${levelColor(x)},${levelColor(Math.min(1,x+.18))})"></i></div><b>${(x*100).toFixed(1)}%</b></div>`;
+}
+
+/* ── Skeleton control: shimmer only on first load, then live-update in place ── */
+const AUTO_SKEL=['stored','oos','coverage','quality','agreement','regime','pbig','psmall','edge','support','entropy','switch','stability','calWeight','liveIssue','livePick','liveConf','liveQuality'];
+let booted=false;
+function setLoading(on){if(on&&!booted){AUTO_SKEL.forEach(id=>skel($(id),true));$('statusText').textContent='SYNCING…';}}
+function clearSkeletons(){AUTO_SKEL.forEach(id=>skel($(id),false));booted=true;}
+
+/* ── Renderers ── */
 function renderFlash(p,d){
-  $('status').textContent='V9.5 · ONLINE'; $('status').className='badge';
-  const st=(d&&d.status)||{}; $('stored').textContent=st.stored_rounds??'—';
-  if(!p||!p.ready){$('pred').textContent='WAIT';$('target').textContent=p?.reason||'Need more history';return}
-  const pick=String(p.prediction||'').toUpperCase(); $('pred').textContent=pick; $('pred').className='signal '+(pick==='BIG'?'big':'small');
-  $('target').textContent=`Target ${p.target_issue||'next'} · based on ${p.based_on_issue||'latest completed round'}`;
-  $('conf').textContent=pct(p.calibrated_confidence); $('confbar').style.width=(Number(p.calibrated_confidence||0)*100)+'%';
-  $('pbig').textContent=pct(p.p_big); $('psmall').textContent=pct(1-Number(p.p_big||0)); $('edge').textContent=pct(p.edge); $('support').textContent=p.support??0;
-  $('oos').textContent=pct(p.rolling_oos_accuracy); $('oosn').textContent=`${p.rolling_oos_predictions??0} walk-forward predictions`; $('coverage').textContent=pct(p.rolling_oos_coverage);
-  $('quality').textContent=p.quality||'LOW'; $('agreement').textContent=p.agreement||'—'; $('regime').textContent=p.regime||'—'; $('choppy').textContent='choppy '+pct(p.choppy_score);
-  $('warnings').innerHTML=(p.warnings||[]).map(x=>`<span class="warn">${esc(x)}</span>`).join('');
-  const m=p.components||{}; $('models').innerHTML=modelRow('Trend follower',m.trend_follower)+modelRow('Reversionist',m.reversionist)+modelRow('Pattern matcher',m.pattern_matcher);
-  $('entropy').textContent=pct(p.entropy20); $('switch').textContent=pct(p.switch_rate); $('stability').textContent=pct(p.sequence_stability); $('calWeight').textContent=pct(p.calibration_weight);
+  const st=(d&&d.status)||{};
+  $('stored').textContent=st.stored_rounds??'—';
+  $('storage').textContent=st.persistence||'storage unavailable';
+  $('oos').textContent=pct(p?.rolling_oos_accuracy);
+  $('oosn').textContent=`${p?.rolling_oos_predictions??0} walk-forward predictions`;
+  $('coverage').textContent=pct(p?.rolling_oos_coverage);
+  $('quality').textContent=p?.quality||'LOW';
+
+  const hero=$('heroCard'),pred=$('pred');
+  if(!p||!p.ready){ // WAIT = skeleton pulse, no fake data
+    pred.className='signal skeleton';pred.textContent='WAIT';
+    skel($('target'),true);
+    $('target').textContent=p?.reason||'Need more history';
+    $('conf').textContent='—';setDial(0);
+    hero.classList.remove('glow-big','glow-small');
+  }else if(p.signal==='SKIP'){
+    const pick=String(p.prediction||'').toUpperCase();
+    pred.className='signal '+(pick==='BIG'?'big':'small');pred.textContent=pick;
+    skel($('target'),false);
+    $('target').textContent=`SKIP ALERT · No fake bet · ${(p.skip_reasons||['low edge']).join(' · ').replaceAll('_',' ')}`;
+    $('conf').textContent=pct(p.calibrated_confidence);setDial(p.calibrated_confidence);
+    hero.classList.toggle('glow-big',pick==='BIG');
+    hero.classList.toggle('glow-small',pick==='SMALL');
+  }else{
+    const pick=String(p.prediction||'').toUpperCase();
+    pred.className='signal '+(pick==='BIG'?'big':'small');
+    pred.textContent=pick;
+    skel($('target'),false);
+    $('target').textContent=`Target ${p.target_issue||'next'} · based on ${p.based_on_issue||'latest completed round'}`;
+    $('conf').textContent=pct(p.calibrated_confidence);
+    setDial(p.calibrated_confidence);
+    hero.classList.toggle('glow-big',pick==='BIG');
+    hero.classList.toggle('glow-small',pick==='SMALL');
+  }
+
+  $('pbig').textContent=pct(p?.p_big);
+  $('psmall').textContent=pct(p?.p_small??(1-Number(p?.p_big||0)));
+  $('edge').textContent=pct(p?.edge);
+  $('support').textContent=p?.support??0;
+  const notices=[...(p?.signal==='SKIP'?['SKIP ALERT']:[]),...(p?.warnings||[])];
+  $('warnings').innerHTML=notices.map(x=>`<span class="warn">${esc(x)}</span>`).join('');
+
+  const m=p?.components||{};
+  $('models').innerHTML=modelRow('Trend follower',m.trend_follower)+modelRow('Reversionist',m.reversionist)+modelRow('Pattern matcher',m.pattern_matcher);
+  $('entropy').textContent=pct(p?.entropy20);
+  $('switch').textContent=pct(p?.switch_rate);
+  $('stability').textContent=pct(p?.sequence_stability);
+  $('calWeight').textContent=pct(p?.calibration_weight);
+  setRegime(p?.regime,p?.choppy_score);
+  setAgreement(p?.agreement);
 }
+
 function renderLive(s){
+  processWalletSettlements(s);
+  renderWallet(s);
   const p=s?.pending_prediction||null;
-  $('liveIssue').textContent=p?.issue||'—'; $('livePick').textContent=p?String(p.prediction).toUpperCase():'—'; $('livePick').className='pick '+(p?.prediction==='big'?'big':p?.prediction==='small'?'small':'');
-  $('liveConf').textContent=p?pct(p.confidence):'—'; $('liveQuality').textContent=p?.quality||'—';
-  const w=Number(s?.wins||0),l=Number(s?.losses||0),t=w+l; $('wins').textContent=w;$('losses').textContent=l;$('hit').textContent=pct(s?.hit_rate);$('settled').textContent=t;
-  const st=s?.current_streak; $('streak').textContent=st?`${st.count}${st.result==='WIN'?'W':'L'}`:'—'; $('streak').className=st?.result==='WIN'?'win':st?.result==='LOSS'?'loss':'';
-  const wp=t?w/t*100:0;$('wbar').style.width=wp+'%';$('lbar').style.width=(t?100-wp:0)+'%';
-  const h=s?.history||[]; $('strip').innerHTML=h.slice(0,24).map(x=>`<span class="dot ${x.result==='WIN'?'w':x.result==='LOSS'?'l':'p'}" title="${esc(x.issue)}">${x.result==='WIN'?'W':x.result==='LOSS'?'L':'P'}</span>`).join('');
-  $('liveRows').innerHTML=h.slice(0,30).map(x=>`<tr><td>${esc(x.issue||'—')}</td><td>${esc(String(x.prediction||'—').toUpperCase())}</td><td>${esc(String(x.actual||'—').toUpperCase())}</td><td>${pct(x.confidence)}</td><td>${esc(x.quality||'—')}</td><td class="${x.result==='WIN'?'win':x.result==='LOSS'?'loss':'pending'}"><b>${esc(x.result||'PENDING')}</b></td></tr>`).join('')||'<tr><td colspan="6">No live paper predictions yet.</td></tr>';
+  $('liveIssue').textContent=p?.issue||'—';
+  const lp=$('livePick');
+  lp.textContent=p?String(p.prediction).toUpperCase():'—';
+  lp.className='pick'+(p?.prediction==='big'?' big':p?.prediction==='small'?' small':'');
+  $('liveConf').textContent=p?pct(p.confidence):'—';
+  $('liveQuality').textContent=p?.quality||'—';
+
+  const w=Number(s?.wins||0),l=Number(s?.losses||0),t=w+l;
+  $('wins').textContent=w;$('losses').textContent=l;
+  $('hit').textContent=pct(s?.hit_rate);$('settled').textContent=t;
+  const stk=s?.current_streak,stEl=$('streak');
+  stEl.textContent=stk?`${stk.count}${stk.result==='WIN'?'W':'L'}`:'—';
+  stEl.className=stk?.result==='WIN'?'win':stk?.result==='LOSS'?'loss':'';
+  const wp=t?w/t*100:0;
+  $('wbar').style.width=wp+'%';$('lbar').style.width=(t?100-wp:0)+'%';
+
+  const h=s?.history||[];
+  const ledgerByIssue=new Map(wallet.ledger.map(x=>[String(x.issue),x]));
+  $('strip').innerHTML=h.slice(0,24).map(x=>`<span class="dot ${x.result==='WIN'?'w':x.result==='LOSS'?'l':'p'}" title="${esc(x.issue)}">${x.result==='WIN'?'W':x.result==='LOSS'?'L':'P'}</span>`).join('')||'<span class="sub">No settled rounds yet.</span>';
+  $('liveRows').innerHTML=h.slice(0,30).map(x=>{
+    const rec=ledgerByIssue.get(String(x.issue)),planned=wallet.active&&p&&String(x.issue)===String(p.issue)?Number(wallet.nextStake):null;
+    const stake=rec?.stake??planned;
+    return `<tr><td>${esc(x.issue||'—')}</td><td>${esc(String(x.prediction||'—').toUpperCase())}</td><td>${esc(String(x.actual||'—').toUpperCase())}</td><td>${pct(x.confidence)}</td><td>${esc(x.quality||'—')}</td><td>${stake==null?'—':money(stake)}</td><td class="${rec?.pnl>0?'win':rec?.pnl<0?'loss':''}">${rec?`${rec.pnl>=0?'+':''}${money(rec.pnl)}`:'—'}</td><td>${rec?money(rec.balance):'—'}</td><td class="${x.result==='WIN'?'win':x.result==='LOSS'?'loss':'pending'}"><b>${esc(x.result||'PENDING')}</b></td></tr>`;
+  }).join('')||`<tr><td colspan="9"><div class="empty"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg><b>No live paper predictions yet</b><div class="sub">Data coming soon — the engine opens one automatically each round.</div></div></td></tr>`;
 }
-function renderRounds(d){const rows=d?.history||[];$('roundRows').innerHTML=rows.slice(0,25).map(r=>`<tr><td>${esc(r.issue||'—')}</td><td>${esc(r.number??'—')}</td><td>${esc(String(r.size||'—').toUpperCase())}</td><td>${esc(String(r.color||'—').toUpperCase())}</td></tr>`).join('')||'<tr><td colspan="4">No rounds.</td></tr>'}
-async function refresh(){try{const options={cache:'no-store',signal:AbortSignal.timeout(10000)};const [a,b,c]=await Promise.all([fetch(`${API}/api/v9.5/flash`,options),fetch(`${API}/api/v9.5/live-sim?limit=60`,options),fetch(`${API}/api/dashboard`,options)]);if(!a.ok||!b.ok||!c.ok)throw Error(`HTTP ${a.status}/${b.status}/${c.status}`);const [p,s,d]=await Promise.all([a.json(),b.json(),c.json()]);renderFlash(p,d);renderLive(s);renderRounds(d)}catch(e){$('status').textContent='OFFLINE · CHECK BACKEND URL';$('status').className='badge err';console.error(e)}finally{setTimeout(refresh,3000)}}
+
+function renderRounds(d){
+  const rows=d?.history||[];
+  $('roundRows').innerHTML=rows.slice(0,25).map(r=>{
+    const sz=String(r.size||'').toUpperCase();
+    return `<tr><td>${esc(r.issue||'—')}</td><td>${esc(r.number??'—')}</td><td class="${sz==='BIG'?'t-big':sz==='SMALL'?'t-small':''}">${esc(sz||'—')}</td><td>${esc(String(r.color||'—').toUpperCase())}</td></tr>`;
+  }).join('')||'<tr><td colspan="4">No rounds.</td></tr>';
+}
+
+/* ── Mobile panel tabs (Point #5) ── */
+document.querySelectorAll('#mtabs button').forEach(b=>b.addEventListener('click',()=>{
+  document.querySelectorAll('#mtabs button').forEach(x=>x.classList.toggle('active',x===b));
+  document.querySelectorAll('.panel').forEach(pn=>pn.classList.toggle('active',pn.id===b.dataset.panel));
+  window.scrollTo({top:0});
+}));
+
+/* ── Toast + Retry (Point #5) ── */
+let toastTimer;
+function toast(msg){
+  $('toastMsg').textContent=msg;
+  $('toast').classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer=setTimeout(()=>$('toast').classList.remove('show'),7000);
+}
+ $('toastRetry').addEventListener('click',()=>{$('toast').classList.remove('show');refresh();});
+
+/* ── Live fake wallet: local-only paper betting ── */
+$('walletStart').value=wallet.startingBalance||1000;
+$('walletBase').value=wallet.baseStake||10;
+$('walletMaxSteps').value=wallet.maxSteps||6;
+$('walletForm').addEventListener('submit',e=>{
+  e.preventDefault();
+  const startingBalance=Number($('walletStart').value),baseStake=Number($('walletBase').value),maxSteps=Number($('walletMaxSteps').value);
+  if(!(startingBalance>0)||!(baseStake>0)||baseStake>startingBalance||!Number.isInteger(maxSteps)||maxSteps<1||maxSteps>12){
+    $('walletMessage').textContent='Use a positive balance and base bet (not above balance), with 1–12 doubling steps.';return;
+  }
+  const settled=(latestLiveSnapshot?.history||[]).filter(x=>x?.result==='WIN'||x?.result==='LOSS').sort((a,b)=>compareIssue(b.issue,a.issue));
+  wallet={...walletDefaults(),active:true,startingBalance,balance:startingBalance,baseStake,nextStake:baseStake,maxSteps,lastProcessedIssue:String(settled[0]?.issue||'')};
+  saveWallet();renderWallet(latestLiveSnapshot||{});toast('Live fake-wallet session started. No real money is used.');
+});
+renderWallet({});
+
+/* ── Status + polling ── */
+let wasOnline=null;
+function setStatus(ok){
+  if(wasOnline===true&&ok===false)toast('Connection lost — retrying automatically. Check the backend URL.');
+  wasOnline=ok;
+  $('status').classList.toggle('err',!ok);
+  $('statusText').textContent=ok?'V9.5.3 · ONLINE':'OFFLINE · CHECK URL';
+}
+
+async function refresh(){
+  setLoading(true);
+  try{
+    const options={cache:'no-store',signal:AbortSignal.timeout(10000)};
+    const [a,b,c]=await Promise.all([
+      fetch(`${API}/api/v9.5/flash`,options),
+      fetch(`${API}/api/v9.5/live-sim?limit=60`,options),
+      fetch(`${API}/api/dashboard`,options)
+    ]);
+    if(!a.ok||!b.ok||!c.ok)throw Error(`HTTP ${a.status}/${b.status}/${c.status}`);
+    const [p,s,d]=await Promise.all([a.json(),b.json(),c.json()]);
+    renderFlash(p,d);renderLive(s);renderRounds(d);
+    setStatus(true);
+    clearSkeletons();
+  }catch(e){
+    setStatus(false);
+    if(!booted)$('target').textContent='Backend unreachable — verify the URL and press Retry.';
+    console.error(e);
+  }finally{
+    setTimeout(refresh,3000);
+  }
+}
 refresh();
 </script>
 </body>

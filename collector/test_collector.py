@@ -1,3 +1,4 @@
+import asyncio
 import importlib.util
 import os
 import unittest
@@ -32,25 +33,31 @@ class CollectorSmokeTests(unittest.TestCase):
         self.module.seen.clear()
         self.posts = []
 
-        self.module.source.get = lambda *args, **kwargs: FakeResponse({
-            "code": 0,
-            "data": {
-                "list": [
-                    {"issueNumber": "102", "number": "2", "color": "red"},
-                    {"issueNumber": "bad-number", "number": "x", "color": "green"},
-                    {"issueNumber": "101", "number": "1", "color": "green"},
-                ]
-            },
-        })
+        class FakeSource:
+            async def get(inner_self, *args, **kwargs):
+                return FakeResponse({
+                    "code": 0,
+                    "data": {
+                        "list": [
+                            {"issueNumber": "102", "number": "2", "color": "red"},
+                            {"issueNumber": "bad-number", "number": "x", "color": "green"},
+                            {"issueNumber": "101", "number": "1", "color": "green"},
+                        ]
+                    },
+                })
 
-        def fake_post(url, json, headers, timeout):
-            self.posts.append((url, json, headers, timeout))
-            return FakeResponse({"ok": True, "stored_rounds": len(self.posts)})
+        outer = self
 
-        self.module.backend.post = fake_post
+        class FakeBackend:
+            async def post(inner_self, url, json, headers):
+                outer.posts.append((url, json, headers))
+                return FakeResponse({"ok": True, "stored_rounds": len(outer.posts)})
+
+        self.source = FakeSource()
+        self.backend = FakeBackend()
 
     def test_oldest_first_header_auth_and_invalid_source_skip(self):
-        self.module.poll_once()
+        asyncio.run(self.module.poll_once(self.source, self.backend))
         self.assertEqual([post[1]["issue"] for post in self.posts], ["101", "102"])
         self.assertNotIn("secret", self.posts[0][1])
         self.assertEqual(self.posts[0][2]["X-Ingest-Secret"], "test-secret")

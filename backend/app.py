@@ -32,7 +32,7 @@ HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "500"))
 BACKFILL_TARGET = int(os.getenv("BACKFILL_TARGET", "500"))
 BACKFILL_PAGE_SIZE = int(os.getenv("BACKFILL_PAGE_SIZE", "100"))
 POLL_SECONDS = float(os.getenv("POLL_SECONDS", "3"))
-MIN_HISTORY = int(os.getenv("MIN_HISTORY", "10"))
+MIN_HISTORY = int(os.getenv("MIN_HISTORY", "50"))
 NUMBER_STATES = list(range(10))
 
 COLOR_STATES = ["red", "green", "violet"]
@@ -1504,7 +1504,7 @@ def _v93_walkforward(vals):
     return iso, raw, actual
 
 def build_v93_flash(games):
-    games = list(reversed(games))
+    games = list(games)
     vals = [_v93_b(g["size"]) for g in games if str(g.get("size","")).lower() in ("big","small")]
     if len(vals) < V93_MIN_TRAIN:
         return {
@@ -1512,7 +1512,7 @@ def build_v93_flash(games):
             "reason": f"need {V93_MIN_TRAIN} rounds",
             "rounds": len(vals),
             "signal": "SKIP",
-            "model": "V9.4.1 Flash"
+            "model": "V9.5 Flash Live"
         }
 
     vals = vals[-V93_WINDOW:]
@@ -1538,46 +1538,56 @@ def build_v93_flash(games):
     stability = _v93_sequence_stability(vals)
 
     agreement = sum((v == 1) == predicted_big for v in votes)
-    threshold = V93_CHOPPY_THRESHOLD if regime == "CHOPPY" else V93_STABLE_THRESHOLD
+    threshold = 0.50
 
-    reasons = []
-    if conf < threshold:
-        reasons.append("confidence")
+    # V9.5 always emits a direction once minimum history is available.
+    # Quality describes evidence strength instead of suppressing the prediction.
+    edge = abs(p_big - 0.5)
+    if conf >= 0.62 and agreement >= 2 and len(wf_y) >= 40:
+        quality = "STRONG"
+    elif conf >= 0.56 and agreement >= 2 and len(wf_y) >= 20:
+        quality = "MEDIUM"
+    else:
+        quality = "LOW"
+
+    warnings = []
     if entropy20 > V93_ENTROPY_STOP:
-        reasons.append("entropy")
+        warnings.append("high_entropy")
     if switch_rate > V93_SWITCH_RATE_STOP:
-        reasons.append("volatility")
+        warnings.append("high_volatility")
     if len(wf_y) < 30:
-        reasons.append("support")
-    if agreement < V93_MIN_AGREEMENT:
-        reasons.append("agreement")
+        warnings.append("low_support")
+    if agreement < 2:
+        warnings.append("low_agreement")
 
-    signal = "PREDICT" if not reasons else "SKIP"
+    signal = "PREDICT"
 
-    # Honest historical coverage/accuracy estimate using the same strict base threshold.
+    # Walk-forward accuracy for every historical direction, not only rare 80%+ cases.
     hits = preds = 0
-    if iso is not None:
-        for rp, y in zip(wf_raw, wf_y):
-            cp = float(iso.predict([rp])[0])
-            pc = max(cp, 1-cp)
-            if pc >= V93_STABLE_THRESHOLD:
-                preds += 1
-                hits += int((cp >= 0.5) == bool(y))
+    for rp, y in zip(wf_raw, wf_y):
+        cp = float(iso.predict([rp])[0]) if iso is not None else float(rp)
+        # Same support-aware calibration blend used for the current prediction.
+        cp = float((1.0 - calibration_weight) * rp + calibration_weight * cp)
+        preds += 1
+        hits += int((cp >= 0.5) == bool(y))
     oos_acc = (hits/preds) if preds else None
-    coverage = (preds/len(wf_y)) if wf_y else 0.0
+    coverage = 1.0 if preds else 0.0
 
     return {
         "ready": True,
-        "model": "V9.4.1 Flash",
+        "model": "V9.5 Flash Live",
         "prediction": predicted,
-        "decision": predicted.upper() if signal == "PREDICT" else "NO EDGE",
+        "decision": predicted.upper(),
         "raw_p_big": round(raw_p, 4),
         "p_big": round(p_big, 4),
         "calibration_weight": round(calibration_weight, 4),
         "calibration_support": len(wf_y),
         "calibrated_confidence": round(conf, 4),
         "signal": signal,
-        "skip_reasons": reasons,
+        "skip_reasons": [],
+        "warnings": warnings,
+        "quality": quality,
+        "edge": round(edge, 4),
         "regime": regime,
         "threshold_used": threshold,
         "choppy_score": round(choppy_score, 4),
@@ -1608,7 +1618,7 @@ def build_v93_flash(games):
             "gap_since_small": int(_v93_gap_since(vals, 0)),
             "gap_to_mean_10": round(0.5 - sum(vals[-10:])/10.0, 4),
         },
-        "note": "V9.4 research signal. Direction is available from 10 completed rounds; NO EDGE/SKIP remains possible when evidence is weak. Confidence is support-aware and is not a guaranteed probability."
+        "note": "V9.5 research direction. Chronology is fixed and a direction is produced every completed round after the minimum history. Confidence remains conservative and is not a guaranteed probability."
     }
 
 
@@ -1630,7 +1640,8 @@ def simulate_v93_virtual_balance(
     stake_percent = float(np.clip(stake_percent, 0.001, 0.05))
     max_rounds = int(np.clip(max_rounds, 1, 1000))
 
-    ordered = list(reversed(games))
+    # Input from load_history is already oldest -> newest.
+    ordered = list(games)
     usable = [g for g in ordered if str(g.get("size","")).lower() in ("big","small")]
     if len(usable) < V93_MIN_TRAIN + 1:
         return {
@@ -1650,18 +1661,12 @@ def simulate_v93_virtual_balance(
 
     for i in range(start_i, len(usable)):
         # Only information available before this historical round is used.
-        train_games = list(reversed(usable[:i]))
+        train_games = usable[:i]
         result = build_v93_flash(train_games)
         actual = str(usable[i]["size"]).lower()
 
-        if not result.get("ready") or result.get("signal") != "PREDICT":
+        if not result.get("ready"):
             skips += 1
-            rows.append({
-                "issue": str(usable[i].get("issue","")),
-                "action": "SKIP",
-                "actual": actual,
-                "balance_pkr": round(balance, 2),
-            })
             continue
 
         prediction = str(result["prediction"]).lower()
@@ -1705,7 +1710,7 @@ def simulate_v93_virtual_balance(
     pnl = balance - starting_balance
     return {
         "ready": True,
-        "mode": "historical_virtual_simulation_only",
+        "mode": "historical_virtual_simulation_every_round",
         "currency": "PKR",
         "starting_balance_pkr": round(starting_balance, 2),
         "target_balance_pkr": round(target_balance, 2),
@@ -1723,13 +1728,210 @@ def simulate_v93_virtual_balance(
         "stop_reason": stop_reason,
         "rounds_processed": len(rows),
         "history": rows[-250:],
-        "note": "Backtest with virtual PKR only. It does not place bets or control a real wallet."
+        "note": "Historical paper simulation only. V9.5 evaluates every generated direction after the minimum history; it does not place real bets or control a wallet."
     }
 
 
+
+
+def _next_issue_id(issue: str) -> str:
+    text = str(issue)
+    if text.isdigit():
+        return str(int(text) + 1)
+    return text + ":next"
+
+
+def _ensure_flash_live_table() -> None:
+    with engine._connect() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS flash_live_bets (
+                issue TEXT PRIMARY KEY,
+                based_on_issue TEXT NOT NULL,
+                prediction TEXT NOT NULL,
+                confidence REAL NOT NULL,
+                quality TEXT NOT NULL,
+                actual TEXT,
+                result TEXT,
+                created_at INTEGER NOT NULL,
+                settled_at INTEGER
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_flash_live_created
+            ON flash_live_bets(created_at)
+        """)
+        conn.commit()
+
+
+def _persist_flash_live_firestore(row: Dict[str, Any]) -> None:
+    payload = dict(row)
+    issue = str(payload["issue"])
+    payload["issue"] = issue
+    payload["issue_num"] = int(issue) if issue.isdigit() else 0
+    get_firestore().collection("flash_live_bets").document(issue).set(payload, merge=True)
+
+
+def _hydrate_flash_live_firestore(limit: int = 250) -> int:
+    restored = 0
+    docs = list(
+        get_firestore().collection("flash_live_bets")
+        .order_by("issue_num", direction=firestore.Query.DESCENDING)
+        .limit(int(max(1, min(limit, 500))))
+        .stream()
+    )
+    with engine._connect() as conn:
+        for doc in reversed(docs):
+            d = doc.to_dict() or {}
+            try:
+                conn.execute("""
+                    INSERT OR REPLACE INTO flash_live_bets
+                    (issue, based_on_issue, prediction, confidence, quality,
+                     actual, result, created_at, settled_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    str(d.get("issue") or doc.id),
+                    str(d.get("based_on_issue") or ""),
+                    str(d.get("prediction") or "").lower(),
+                    float(d.get("confidence") or 0.5),
+                    str(d.get("quality") or "LOW"),
+                    d.get("actual"),
+                    d.get("result"),
+                    int(d.get("created_at") or 0),
+                    d.get("settled_at"),
+                ))
+                restored += 1
+            except Exception:
+                continue
+        conn.commit()
+    return restored
+
+
+def _settle_flash_live_bet(game: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    issue = str(game["issue"])
+    actual = str(game["size"]).lower()
+    now = int(time.time())
+    with engine._connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM flash_live_bets WHERE issue = ?",
+            (issue,),
+        ).fetchone()
+        if not row or row["result"]:
+            return None
+        result = "WIN" if str(row["prediction"]).lower() == actual else "LOSS"
+        conn.execute("""
+            UPDATE flash_live_bets
+            SET actual = ?, result = ?, settled_at = ?
+            WHERE issue = ?
+        """, (actual, result, now, issue))
+        conn.commit()
+        out = dict(conn.execute(
+            "SELECT * FROM flash_live_bets WHERE issue = ?", (issue,)
+        ).fetchone())
+    try:
+        _persist_flash_live_firestore(out)
+    except Exception:
+        pass
+    return out
+
+
+def _open_flash_live_bet(games: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not games:
+        return None
+    flash = build_v93_flash(games)
+    if not flash.get("ready"):
+        return None
+    based_on_issue = str(games[-1]["issue"])
+    target_issue = _next_issue_id(based_on_issue)
+    row = {
+        "issue": target_issue,
+        "based_on_issue": based_on_issue,
+        "prediction": str(flash["prediction"]).lower(),
+        "confidence": float(flash.get("calibrated_confidence", 0.5)),
+        "quality": str(flash.get("quality", "LOW")),
+        "actual": None,
+        "result": None,
+        "created_at": int(time.time()),
+        "settled_at": None,
+    }
+    with engine._connect() as conn:
+        conn.execute("""
+            INSERT OR IGNORE INTO flash_live_bets
+            (issue, based_on_issue, prediction, confidence, quality,
+             actual, result, created_at, settled_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            row["issue"], row["based_on_issue"], row["prediction"],
+            row["confidence"], row["quality"], None, None,
+            row["created_at"], None,
+        ))
+        conn.commit()
+        saved = conn.execute(
+            "SELECT * FROM flash_live_bets WHERE issue = ?", (target_issue,)
+        ).fetchone()
+        out = dict(saved) if saved else row
+    try:
+        _persist_flash_live_firestore(out)
+    except Exception:
+        pass
+    return out
+
+
+def _flash_live_status(limit: int = 50) -> Dict[str, Any]:
+    limit = int(max(1, min(limit, 250)))
+    with engine._connect() as conn:
+        rows = [dict(r) for r in conn.execute("""
+            SELECT * FROM flash_live_bets
+            ORDER BY
+                CASE WHEN issue GLOB '[0-9]*' THEN CAST(issue AS INTEGER)
+                     ELSE created_at END DESC
+            LIMIT ?
+        """, (limit,)).fetchall()]
+        agg = conn.execute("""
+            SELECT
+                SUM(CASE WHEN result='WIN' THEN 1 ELSE 0 END) AS wins,
+                SUM(CASE WHEN result='LOSS' THEN 1 ELSE 0 END) AS losses,
+                SUM(CASE WHEN result IS NULL THEN 1 ELSE 0 END) AS pending,
+                COUNT(*) AS total
+            FROM flash_live_bets
+        """).fetchone()
+    wins = int(agg["wins"] or 0)
+    losses = int(agg["losses"] or 0)
+    pending = int(agg["pending"] or 0)
+    settled = wins + losses
+    current_pending = next((r for r in rows if not r.get("result")), None)
+    streak_type = None
+    streak = 0
+    for r in rows:
+        result = r.get("result")
+        if result not in ("WIN", "LOSS"):
+            continue
+        if streak_type is None:
+            streak_type = result
+            streak = 1
+        elif result == streak_type:
+            streak += 1
+        else:
+            break
+    return {
+        "ready": True,
+        "mode": "live_paper_simulator",
+        "wins": wins,
+        "losses": losses,
+        "pending": pending,
+        "settled": settled,
+        "hit_rate": round(wins / settled, 4) if settled else None,
+        "current_streak": None if not streak_type else {"result": streak_type, "count": streak},
+        "pending_prediction": current_pending,
+        "history": rows,
+        "note": "Paper simulator only: one virtual unit per prediction, no real-money or wallet integration.",
+    }
+
+
+_ensure_flash_live_table()
+
 app = FastAPI(
     title="WinGo Statistical Predictor API",
-    version="9.4.0",
+    version="9.5.0",
     lifespan=lifespan,
 )
 
@@ -1757,7 +1959,7 @@ app.add_middleware(
 def root():
     return {
         "name": "WinGo Statistical Predictor API",
-        "version": "9.3.0",
+        "version": "9.5.0",
         "status": "online",
         "docs": "/docs",
     }
@@ -1808,13 +2010,25 @@ class RoundInput(BaseModel):
     secret: str
 
 
+@app.get("/api/v9.5/flash")
 @app.get("/api/v9.4/flash")
 @app.get("/api/v9.3/flash")
 def v93_flash():
     history = engine.load_history(HISTORY_LIMIT)
-    return build_v93_flash(history)
+    result = build_v93_flash(history)
+    if history and result.get("ready"):
+        based_on = str(history[-1]["issue"])
+        result["based_on_issue"] = based_on
+        result["target_issue"] = _next_issue_id(based_on)
+    return result
 
 
+@app.get("/api/v9.5/live-sim")
+def v95_live_sim(limit: int = Query(50, ge=1, le=250)):
+    return _flash_live_status(limit)
+
+
+@app.get("/api/v9.5/simulate")
 @app.get("/api/v9.4/simulate")
 @app.get("/api/v9.3/simulate")
 def v93_simulate(
@@ -1873,6 +2087,10 @@ def ingest_round(round_data: RoundInput):
 
 
             restored_from_firestore = engine.hydrate_rounds_firestore(HISTORY_LIMIT)
+            try:
+                _hydrate_flash_live_firestore(250)
+            except Exception:
+                pass
 
 
     except Exception as exc:
@@ -1884,6 +2102,8 @@ def ingest_round(round_data: RoundInput):
 
     inserted = engine.save_round(game)
 
+    # Settle the paper prediction that targeted this completed round.
+    live_settled = _settle_flash_live_bet(game)
 
 
     try:
@@ -1909,6 +2129,7 @@ def ingest_round(round_data: RoundInput):
 
 
     prediction = engine.save_next_prediction(history) if inserted else None
+    live_prediction = _open_flash_live_bet(history) if inserted else None
 
     return {
         "ok": True,
@@ -1916,6 +2137,8 @@ def ingest_round(round_data: RoundInput):
         "round": game,
         "stored_rounds": engine.count_rounds(),
         "prediction": prediction,
+        "live_flash_prediction": live_prediction,
+        "live_flash_settled": live_settled,
         "restored_from_firestore": restored_from_firestore,
         "firebase_error": firebase_error,
         "storage": "firestore-persistent/sqlite-cache",

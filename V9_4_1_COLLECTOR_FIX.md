@@ -1,4 +1,4 @@
-# V9.4.1 Collector Recovery Fix
+# V9.5 Collector Recovery Fix
 
 The collector now:
 - retries transient 502/backend errors with bounded backoff;

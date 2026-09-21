@@ -86,7 +86,7 @@ def post_round(x):
     print(f"[FAILED] {issue} - will retry from backfill window")
     return False
 
-print(f"WinGo V9.4.1 collector -> {BACKEND}")
+print(f"WinGo V9.5 collector -> {BACKEND}")
 print(f"Recovery/backfill window: {N} rounds")
 
 while True:

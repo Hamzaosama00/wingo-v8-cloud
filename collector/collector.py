@@ -65,7 +65,7 @@ def post_round(x):
             if reset:
                 print(
                     f"[BACKEND RESTART] stored {last_backend_count} -> {count}; "
-                    f"replaying recent {N} completed rounds"
+                    f"backend cache reset detected; replaying recent {N} rounds as fallback"
                 )
                 # Force the current source page to be replayed on the next loop.
                 # Backend deduplication makes this safe.
@@ -86,7 +86,7 @@ def post_round(x):
     print(f"[FAILED] {issue} - will retry from backfill window")
     return False
 
-print(f"WinGo V9.5 collector -> {BACKEND}")
+print(f"WinGo V9.5.1 collector -> {BACKEND}")
 print(f"Recovery/backfill window: {N} rounds")
 
 while True:

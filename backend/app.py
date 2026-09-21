@@ -192,13 +192,20 @@ class PredictorEngine:
         get_firestore().collection("rounds").document(str(game["issue"])).set(payload, merge=True)
 
     def hydrate_rounds_firestore(self, limit: int = HISTORY_LIMIT) -> int:
-        """Restore Render's ephemeral SQLite cache from permanent Firestore."""
+        """Restore the ephemeral SQLite cache from Firestore with bounded RAM.
+
+        Documents are streamed one at a time instead of materializing the whole
+        Firestore result into a Python list. SQLite history is sorted by issue
+        when read, so insertion order is not required here.
+        """
         db = get_firestore()
-        docs = list(db.collection("rounds").order_by(
-            "issue_num", direction=firestore.Query.DESCENDING
-        ).limit(limit).stream())
+        query = (
+            db.collection("rounds")
+            .order_by("issue_num", direction=firestore.Query.DESCENDING)
+            .limit(max(1, int(limit)))
+        )
         restored = 0
-        for doc in reversed(docs):
+        for doc in query.stream():
             d = doc.to_dict() or {}
             try:
                 n = int(d["number"])
@@ -1313,6 +1320,27 @@ engine = PredictorEngine()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Render uses an ephemeral filesystem. Hydrate the SQLite cache BEFORE the
+    # service becomes ready, so the first collector POST after a deploy cannot
+    # create a fresh 1-round database. During this short restore Render may
+    # return 502/503; the collector retries until startup is complete.
+    local_before = engine.count_rounds()
+    if local_before == 0:
+        try:
+            restored = engine.hydrate_rounds_firestore(HISTORY_LIMIT)
+            print(f"[STARTUP] Firestore -> SQLite restored={restored} rounds", flush=True)
+        except Exception as exc:
+            engine.last_error = f"startup hydrate: {type(exc).__name__}: {exc}"
+            print(f"[STARTUP] Firestore hydration failed: {engine.last_error}", flush=True)
+
+        try:
+            restored_live = _hydrate_flash_live_firestore(250)
+            if restored_live:
+                print(f"[STARTUP] live simulator restored={restored_live}", flush=True)
+        except Exception as exc:
+            print(f"[STARTUP] live simulator hydration warning: {type(exc).__name__}: {exc}", flush=True)
+
+    print(f"[STARTUP] backend ready with {engine.count_rounds()} cached rounds", flush=True)
     engine.start_worker()
     yield
     engine.stop_worker()
@@ -1512,7 +1540,7 @@ def build_v93_flash(games):
             "reason": f"need {V93_MIN_TRAIN} rounds",
             "rounds": len(vals),
             "signal": "SKIP",
-            "model": "V9.5 Flash Live"
+            "model": "V9.5.1 Flash Live"
         }
 
     vals = vals[-V93_WINDOW:]
@@ -1575,7 +1603,7 @@ def build_v93_flash(games):
 
     return {
         "ready": True,
-        "model": "V9.5 Flash Live",
+        "model": "V9.5.1 Flash Live",
         "prediction": predicted,
         "decision": predicted.upper(),
         "raw_p_big": round(raw_p, 4),
@@ -1618,7 +1646,7 @@ def build_v93_flash(games):
             "gap_since_small": int(_v93_gap_since(vals, 0)),
             "gap_to_mean_10": round(0.5 - sum(vals[-10:])/10.0, 4),
         },
-        "note": "V9.5 research direction. Chronology is fixed and a direction is produced every completed round after the minimum history. Confidence remains conservative and is not a guaranteed probability."
+        "note": "V9.5.1 research direction. Chronology is fixed and a direction is produced every completed round after the minimum history. Confidence remains conservative and is not a guaranteed probability."
     }
 
 
@@ -1728,7 +1756,7 @@ def simulate_v93_virtual_balance(
         "stop_reason": stop_reason,
         "rounds_processed": len(rows),
         "history": rows[-250:],
-        "note": "Historical paper simulation only. V9.5 evaluates every generated direction after the minimum history; it does not place real bets or control a wallet."
+        "note": "Historical paper simulation only. V9.5.1 evaluates every generated direction after the minimum history; it does not place real bets or control a wallet."
     }
 
 
@@ -1931,7 +1959,7 @@ _ensure_flash_live_table()
 
 app = FastAPI(
     title="WinGo Statistical Predictor API",
-    version="9.5.0",
+    version="9.5.1",
     lifespan=lifespan,
 )
 
@@ -1959,7 +1987,7 @@ app.add_middleware(
 def root():
     return {
         "name": "WinGo Statistical Predictor API",
-        "version": "9.5.0",
+        "version": "9.5.1",
         "status": "online",
         "docs": "/docs",
     }

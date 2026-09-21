@@ -32,7 +32,7 @@ HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "500"))
 BACKFILL_TARGET = int(os.getenv("BACKFILL_TARGET", "500"))
 BACKFILL_PAGE_SIZE = int(os.getenv("BACKFILL_PAGE_SIZE", "100"))
 POLL_SECONDS = float(os.getenv("POLL_SECONDS", "3"))
-MIN_HISTORY = int(os.getenv("MIN_HISTORY", "50"))
+MIN_HISTORY = int(os.getenv("MIN_HISTORY", "10"))
 NUMBER_STATES = list(range(10))
 
 COLOR_STATES = ["red", "green", "violet"]

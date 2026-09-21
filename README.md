@@ -1,33 +1,48 @@
-# WinGo V9.2 Pro Experimental
+# WinGo V9.5.1 Flash Live
 
-Adds an experimental Big/Small research engine on top of the V7 number-first backend.
+Big/Small research API, live paper simulator, collector, and static dashboard.
+Predictions are experimental and are not guaranteed outcomes.
 
-## V9.2 features
-- Pattern transition matrix
-- lag-1 / lag-2 / lag-3
-- gap since Big / Small
-- run length and momentum
-- rolling entropy / volatility proxy
-- order-aware sequence stability
-- STABLE / CHOPPY regime-specific ensemble
-- training-only ablation pruning
-- walk-forward Isotonic calibration
-- strict PREDICT/SKIP gating
-- OOS accuracy + coverage reporting
-- bounded calibration window to reduce cloud RAM/CPU usage
+## Backend
 
-Endpoint: `/api/v9.2/pro`
-
-Default gates:
-- STABLE confidence: 0.72
-- CHOPPY confidence: 0.80
-- entropy stop: 0.75
-
-These are experiment thresholds, not a promised accuracy. Use the OOS accuracy and coverage fields to judge whether the model has demonstrated an edge.
-
-## Run
+```text
 pip install -r backend/requirements.txt
 cd backend
 uvicorn app:app --host 0.0.0.0 --port 8000
+```
 
-For Render, scikit-learn/numpy use materially more memory than the old statistical engine. A small-memory instance may still restart. If that happens, run V9.2 on a VM with more RAM or separate model computation from the API.
+Required environment variable: `INGEST_SECRET`.
+
+Recommended production variables: `FIREBASE_PROJECT_ID`,
+`GOOGLE_APPLICATION_CREDENTIALS`, `CORS_ORIGINS`, `HISTORY_LIMIT`, and
+`DB_PATH`. The backend restores Firestore history into its SQLite cache at
+startup when the cache is empty.
+
+## Collector
+
+Run `python collector/collector.py` with:
+
+- `BACKEND_URL` set to the deployed backend URL.
+- `INGEST_SECRET` set to exactly the same value as the backend.
+- Optional `SOURCE_API`, `COLLECTOR_POLL_SECONDS`, and
+  `COLLECTOR_BACKFILL_SIZE` settings.
+
+The collector sends credentials in `X-Ingest-Secret`, retries transient
+failures, replays a bounded recovery window, and stops with a clear message on
+authentication/configuration errors.
+
+## Dashboard
+
+Deploy `frontend/` as a static site. If the backend URL changes, enter the new
+URL in the dashboard's **Backend URL** field and select **Connect**. The value
+is saved in the browser; `?api=https://example.com` is also supported.
+
+## Checks
+
+```text
+python -m unittest backend/test_smoke.py collector/test_collector.py -v
+```
+
+The checks cover ingest authentication and validation, duplicate/conflicting
+results, live prediction settlement, the backend-poller/collector race, source
+ordering, and collector header authentication.

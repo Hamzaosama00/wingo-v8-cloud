@@ -1,5 +1,6 @@
 import math
 import os
+import secrets
 import sqlite3
 import threading
 import time
@@ -14,9 +15,9 @@ import numpy as np
 from sklearn.isotonic import IsotonicRegression
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 HISTORY_URL = os.getenv(
@@ -183,6 +184,14 @@ class PredictorEngine:
         with self._connect() as conn:
             row = conn.execute("SELECT COUNT(*) AS c FROM rounds").fetchone()
             return int(row["c"])
+
+    def get_round(self, issue: str) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT issue, number, color, size, parity, seen_at FROM rounds WHERE issue = ?",
+                (str(issue),),
+            ).fetchone()
+        return dict(row) if row else None
 
     def persist_round_firestore(self, game: Dict[str, Any]) -> None:
         payload = dict(game)
@@ -1142,7 +1151,17 @@ class PredictorEngine:
         games = self.parse_api_history(data)
 
         for game in games:
-            self.save_round(game)
+            inserted = self.save_round(game)
+            # The backend poller and the external collector can see the same
+            # result in either order. Settlement is idempotent, so always try
+            # it here instead of relying on the collector winning that race.
+            _settle_flash_live_bet(game)
+
+            if inserted:
+                try:
+                    self.persist_round_firestore(game)
+                except Exception as exc:
+                    self.last_error = f"Firestore persist: {type(exc).__name__}: {exc}"
 
         self.verify_pending_predictions()
 
@@ -1156,6 +1175,7 @@ class PredictorEngine:
         if latest_issue != self.last_seen_issue:
             self.last_seen_issue = latest_issue
             self.save_next_prediction(stored)
+            _open_flash_live_bet(stored)
 
     def worker_loop(self) -> None:
         try:
@@ -2032,10 +2052,12 @@ def stats(window: int = 200):
 INGEST_SECRET = os.getenv("INGEST_SECRET", "")
 
 class RoundInput(BaseModel):
-    issue: str
-    number: int
-    color: str
-    secret: str
+    issue: str = Field(min_length=1, max_length=64, pattern=r"^\d+$")
+    number: int = Field(ge=0, le=9)
+    color: str = Field(min_length=1, max_length=32)
+    # Kept for compatibility with older collectors. New collectors send the
+    # secret in X-Ingest-Secret so credentials do not appear in JSON logs.
+    secret: str = ""
 
 
 @app.get("/api/v9.5/flash")
@@ -2076,18 +2098,22 @@ def v93_simulate(
 
 
 @app.post("/api/ingest")
-def ingest_round(round_data: RoundInput):
-    if not INGEST_SECRET or round_data.secret != INGEST_SECRET:
-        return {"ok": False, "error": "Unauthorized"}
+def ingest_round(
+    round_data: RoundInput,
+    x_ingest_secret: Optional[str] = Header(default=None, alias="X-Ingest-Secret"),
+):
+    if not INGEST_SECRET:
+        raise HTTPException(status_code=503, detail="INGEST_SECRET is not configured")
+
+    supplied_secret = x_ingest_secret or round_data.secret
+    if not secrets.compare_digest(supplied_secret, INGEST_SECRET):
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
     color = engine.parse_color(round_data.color)
     if color is None:
-        return {"ok": False, "error": "Invalid color"}
+        raise HTTPException(status_code=422, detail="Invalid color")
 
     number = int(round_data.number)
-    if number < 0 or number > 9:
-        return {"ok": False, "error": "Invalid number"}
-
     game = {
         "issue": str(round_data.issue),
         "number": number,
@@ -2095,6 +2121,12 @@ def ingest_round(round_data: RoundInput):
         "size": "big" if number >= 5 else "small",
         "parity": "even" if number % 2 == 0 else "odd",
     }
+
+    existing = engine.get_round(game["issue"])
+    if existing and any(existing[field] != game[field] for field in ("number", "color", "size", "parity")):
+        # Never let a conflicting duplicate overwrite Firestore while SQLite
+        # keeps the original INSERT OR IGNORE value.
+        raise HTTPException(status_code=409, detail="Conflicting result for existing issue")
 
     restored_from_firestore = 0
 
@@ -2130,6 +2162,11 @@ def ingest_round(round_data: RoundInput):
 
     inserted = engine.save_round(game)
 
+    if not inserted:
+        stored_game = engine.get_round(game["issue"])
+        if stored_game and any(stored_game[field] != game[field] for field in ("number", "color", "size", "parity")):
+            raise HTTPException(status_code=409, detail="Conflicting result for existing issue")
+
     # Settle the paper prediction that targeted this completed round.
     live_settled = _settle_flash_live_bet(game)
 
@@ -2156,8 +2193,11 @@ def ingest_round(round_data: RoundInput):
     history = engine.load_history(HISTORY_LIMIT)
 
 
-    prediction = engine.save_next_prediction(history) if inserted else None
-    live_prediction = _open_flash_live_bet(history) if inserted else None
+    # These operations are idempotent. Run them for duplicates too, because
+    # the internal poller may have inserted the round milliseconds before the
+    # collector request arrived.
+    prediction = engine.save_next_prediction(history)
+    live_prediction = _open_flash_live_bet(history)
 
     return {
         "ok": True,
